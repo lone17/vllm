@@ -3,8 +3,17 @@ import pickle
 from abc import ABC, abstractmethod
 from datetime import datetime
 from functools import wraps
-from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterable, List,
-                    Optional, Type, TypeVar)
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+)
 
 import torch
 import torch.nn as nn
@@ -22,12 +31,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-T = TypeVar('T', bound="BroadcastableModelInput")
+T = TypeVar("T", bound="BroadcastableModelInput")
 
 
 def _add_attn_metadata_broadcastable_dict(
-        tensor_dict: Dict[str, Any],
-        attn_metadata: Optional["AttentionMetadata"]) -> None:
+    tensor_dict: Dict[str, Any], attn_metadata: Optional["AttentionMetadata"]
+) -> None:
     """
     Helper method to update tensor_dict with broadcastable
     AttentionMetadata fields.
@@ -56,7 +65,8 @@ def _init_attn_metadata_from_tensor_dict(
 
 
 def _init_sampling_metadata_from_tensor_dict(  # type: ignore
-        tensor_dict: Dict[str, Any]) -> Dict[str, Any]:
+    tensor_dict: Dict[str, Any],
+) -> Dict[str, Any]:
     """
     Helper method to initialize SamplingMetadata based on broadcastable
     SamplingMetadata fields.
@@ -77,20 +87,19 @@ def _init_sampling_metadata_from_tensor_dict(  # type: ignore
 
 
 def _add_sampling_metadata_broadcastable_dict(
-        tensor_dict: Dict[str, Any],
-        sampling_metadata: Optional["SamplingMetadata"]) -> None:
+    tensor_dict: Dict[str, Any], sampling_metadata: Optional["SamplingMetadata"]
+) -> None:
     """
     Helper method to update tensor_dict with broadcastable
     SamplingMetadata fields.
     """
     if sampling_metadata is not None:
-        tensor_dict["selected_token_indices"] = (
-            sampling_metadata.selected_token_indices)
+        tensor_dict["selected_token_indices"] = sampling_metadata.selected_token_indices
 
 
 def _init_frozen_model_input_from_tensor_dict(
-        frozen_model_input_cls: Type["ModelRunnerInputBase"],
-        tensor_dict: Dict[str, Any]) -> Dict[str, Any]:
+    frozen_model_input_cls: Type["ModelRunnerInputBase"], tensor_dict: Dict[str, Any]
+) -> Dict[str, Any]:
     """
     Helper method to initialize a frozen ModelInput based on broadcastable
     """
@@ -105,8 +114,9 @@ def _init_frozen_model_input_from_tensor_dict(
     return tensor_dict
 
 
-def dump_input_when_exception(exclude_args: Optional[List[int]] = None,
-                              exclude_kwargs: Optional[List[str]] = None):
+def dump_input_when_exception(
+    exclude_args: Optional[List[int]] = None, exclude_kwargs: Optional[List[str]] = None
+):
 
     def _inner(func):
 
@@ -117,8 +127,7 @@ def dump_input_when_exception(exclude_args: Optional[List[int]] = None,
             except Exception as err:
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 filename = f"/tmp/err_{func.__name__}_input_{timestamp}.pkl"
-                logger.info("Writing input of failed execution to %s...",
-                            filename)
+                logger.info("Writing input of failed execution to %s...", filename)
                 with open(filename, "wb") as filep:
                     dumped_inputs = {
                         k: v
@@ -131,27 +140,30 @@ def dump_input_when_exception(exclude_args: Optional[List[int]] = None,
 
                     # Only persist dtype and shape for kvcache tensors
                     # (can be way to big otherwise)
-                    if (kv_caches := dumped_inputs.get("kv_caches")) \
-                        and isinstance(kv_caches, Iterable):
-                        dumped_inputs["kv_caches"] = [(t.dtype, t.shape)
-                                                      for t in kv_caches
-                                                      if is_tensor(t)]
+                    if (kv_caches := dumped_inputs.get("kv_caches")) and isinstance(
+                        kv_caches, Iterable
+                    ):
+                        dumped_inputs["kv_caches"] = [
+                            (t.dtype, t.shape) for t in kv_caches if is_tensor(t)
+                        ]
 
                     try:
                         pickle.dump(dumped_inputs, filep)
                     except Exception as pickle_err:
                         logger.warning(
                             "Failed to pickle inputs of failed execution: %s",
-                            str(pickle_err))
-                        raise type(err)(f"Error in model execution: "
-                                        f"{str(err)}") from err
+                            str(pickle_err),
+                        )
+                        raise type(err)(
+                            f"Error in model execution: {str(err)}"
+                        ) from err
 
                     logger.info(
-                        "Completed writing input of failed execution to %s.",
-                        filename)
+                        "Completed writing input of failed execution to %s.", filename
+                    )
                 raise type(err)(
-                    f"Error in model execution (input dumped to {filename}): "
-                    f"{str(err)}") from err
+                    f"Error in model execution (input dumped to {filename}): {str(err)}"
+                ) from err
 
         return _wrapper
 
@@ -193,16 +205,15 @@ class ModelRunnerInputBase(BroadcastableModelInput):
     ModelRunnerInputBase subclass, add their required fields, and specify how to
     serialize/deserialize a ModelInput for broadcast between workers.
     """
+
     pass
 
 
 class ModelRunnerInputBuilderBase(ABC, Generic[T]):
-    """A builder to create ModelRunnerInputBase objects.
-  """
+    """A builder to create ModelRunnerInputBase objects."""
 
     @abstractmethod
-    def prepare(self,
-                finished_requests_ids: Optional[List[str]] = None) -> None:
+    def prepare(self, finished_requests_ids: Optional[List[str]] = None) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -241,6 +252,7 @@ class ModelRunnerBase(ABC, Generic[T]):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        self.control_vector_config = vllm_config.control_vector_config
 
     # Map of request_id -> generator used for seeded random sampling
     generators: Dict[str, torch.Generator] = {}

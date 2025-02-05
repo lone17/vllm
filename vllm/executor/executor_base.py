@@ -1,12 +1,12 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import (Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple,
-                    Union)
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch.nn as nn
 from typing_extensions import TypeVar
 
-from vllm.config import VllmConfig
+from vllm.config import ControlVectorConfig, VllmConfig
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -25,7 +25,7 @@ class ExecutorBase(ABC):
     """Base class for all executors.
 
     An executor is responsible for executing the model on one device,
-    or it can be a distributed executor 
+    or it can be a distributed executor
     that can execute the model on multiple devices.
     """
 
@@ -46,6 +46,7 @@ class ExecutorBase(ABC):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        self.control_vector_config = vllm_config.control_vector_config
         self._init_executor()
         self.is_sleeping = False
 
@@ -54,11 +55,13 @@ class ExecutorBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def collective_rpc(self,
-                       method: Union[str, Callable[..., _R]],
-                       timeout: Optional[float] = None,
-                       args: Tuple = (),
-                       kwargs: Optional[Dict[str, Any]] = None) -> List[_R]:
+    def collective_rpc(
+        self,
+        method: Union[str, Callable[..., _R]],
+        timeout: Optional[float] = None,
+        args: Tuple = (),
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[_R]:
         """
         Execute an RPC call on all workers.
 
@@ -76,7 +79,7 @@ class ExecutorBase(ABC):
 
         Returns:
             A list containing the results from each worker.
-        
+
         Note:
             It is recommended to use this API to only pass control messages,
             and set up data-plane communication to pass data.
@@ -102,22 +105,29 @@ class ExecutorBase(ABC):
         return a, b
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks) -> None:
-        """Initialize the KV cache by invoking the underlying worker.
-        """
+        """Initialize the KV cache by invoking the underlying worker."""
         # NOTE: This is logged in the executor because there can be >1 workers.
-        logger.info("# %s blocks: %d, # CPU blocks: %d",
-                    current_platform.dispatch_key, num_gpu_blocks,
-                    num_cpu_blocks)
-        max_concurrency = (num_gpu_blocks * self.cache_config.block_size /
-                           self.model_config.max_model_len)
-        logger.info("Maximum concurrency for %s tokens per request: %.2fx",
-                    self.model_config.max_model_len, max_concurrency)
+        logger.info(
+            "# %s blocks: %d, # CPU blocks: %d",
+            current_platform.dispatch_key,
+            num_gpu_blocks,
+            num_cpu_blocks,
+        )
+        max_concurrency = (
+            num_gpu_blocks
+            * self.cache_config.block_size
+            / self.model_config.max_model_len
+        )
+        logger.info(
+            "Maximum concurrency for %s tokens per request: %.2fx",
+            self.model_config.max_model_len,
+            max_concurrency,
+        )
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-        self.collective_rpc("initialize_cache",
-                            args=(num_gpu_blocks, num_cpu_blocks))
+        self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         """
@@ -133,8 +143,7 @@ class ExecutorBase(ABC):
     def execute_model(
         self, execute_model_req: ExecuteModelRequest
     ) -> Optional[List[Union[SamplerOutput, PoolerOutput]]]:
-        output = self.collective_rpc("execute_model",
-                                     args=(execute_model_req, ))
+        output = self.collective_rpc("execute_model", args=(execute_model_req,))
         return output[0]
 
     def stop_remote_worker_execution_loop(self) -> None:
@@ -143,15 +152,15 @@ class ExecutorBase(ABC):
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         assert lora_request.lora_int_id > 0, "lora_id must be greater than 0."
-        return all(self.collective_rpc("add_lora", args=(lora_request, )))
+        return all(self.collective_rpc("add_lora", args=(lora_request,)))
 
     def remove_lora(self, lora_id: int) -> bool:
         assert lora_id > 0, "lora_id must be greater than 0."
-        return all(self.collective_rpc("remove_lora", args=(lora_id, )))
+        return all(self.collective_rpc("remove_lora", args=(lora_id,)))
 
     def pin_lora(self, lora_id: int) -> bool:
         assert lora_id > 0, "lora_id must be greater than 0."
-        return all(self.collective_rpc("pin_lora", args=(lora_id, )))
+        return all(self.collective_rpc("pin_lora", args=(lora_id,)))
 
     def list_loras(self) -> Set[int]:
         sets = self.collective_rpc("list_loras")
@@ -159,33 +168,25 @@ class ExecutorBase(ABC):
             assert s == sets[0], "All workers should have the same LORAs."
         return sets[0]
 
-    def add_prompt_adapter(
-            self, prompt_adapter_request: PromptAdapterRequest) -> bool:
-        assert prompt_adapter_request.prompt_adapter_id > 0, \
-            "prompt_adapter_id must be greater than 0."
+    def add_prompt_adapter(self, prompt_adapter_request: PromptAdapterRequest) -> bool:
+        assert (
+            prompt_adapter_request.prompt_adapter_id > 0
+        ), "prompt_adapter_id must be greater than 0."
         return all(
-            self.collective_rpc("add_prompt_adapter",
-                                args=(prompt_adapter_request, )))
+            self.collective_rpc("add_prompt_adapter", args=(prompt_adapter_request,))
+        )
 
     def remove_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        assert prompt_adapter_id > 0, \
-            "prompt_adapter_id must be greater than 0."
-        return all(
-            self.collective_rpc("remove_prompt_adapter",
-                                args=(prompt_adapter_id, )))
+        raise NotImplementedError
 
     def pin_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        assert prompt_adapter_id > 0, \
-            "prompt_adapter_id must be greater than 0."
-        return all(
-            self.collective_rpc("pin_prompt_adapter",
-                                args=(prompt_adapter_id, )))
+        assert prompt_adapter_id > 0, "prompt_adapter_id must be greater than 0."
+        return all(self.collective_rpc("pin_prompt_adapter", args=(prompt_adapter_id,)))
 
     def list_prompt_adapters(self) -> Set[int]:
         sets = self.collective_rpc("list_prompt_adapters")
         for s in sets:
-            assert (s == sets[0]
-                    ), "All workers should have the same prompt adapters."
+            assert s == sets[0], "All workers should have the same prompt adapters."
         return sets[0]
 
     def start_profile(self) -> None:
@@ -214,10 +215,17 @@ class ExecutorBase(ABC):
         pattern: Optional[str] = None,
         max_size: Optional[int] = None,
     ) -> None:
-        self.collective_rpc("save_sharded_state",
-                            kwargs=dict(path=path,
-                                        pattern=pattern,
-                                        max_size=max_size))
+        self.collective_rpc(
+            "save_sharded_state",
+            kwargs=dict(path=path, pattern=pattern, max_size=max_size),
+        )
+
+    def add_control_vector(self, control_vector_request: ControlVectorRequest) -> bool:
+        assert control_vector_request.adapter_id > 0
+        return self.driver_worker.add_control_vector(control_vector_request)
+
+    def remove_control_vector(self, cv_id: int) -> bool:
+        return self.driver_worker.add_control_vector(cv_id)
 
     @abstractmethod
     def check_health(self) -> None:
@@ -233,8 +241,8 @@ class ExecutorBase(ABC):
         self.shutdown()
 
     async def execute_model_async(
-            self,
-            execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
+        self, execute_model_req: ExecuteModelRequest
+    ) -> List[SamplerOutput]:
         """Executes one model step on the given sequences."""
         output = await make_async(self.execute_model)(execute_model_req)
         return output
@@ -267,7 +275,8 @@ class DistributedExecutorBase(ExecutorBase):
         if self.parallel_worker_tasks is None:
             self.parallel_worker_tasks = self._run_workers(
                 "start_worker_execution_loop",
-                async_run_tensor_parallel_workers_only=True)
+                async_run_tensor_parallel_workers_only=True,
+            )
 
         # Only the driver worker returns the sampling results.
         driver_outputs = self._driver_execute_model(execute_model_req)
@@ -297,11 +306,13 @@ class DistributedExecutorBase(ExecutorBase):
         """
         raise NotImplementedError
 
-    def collective_rpc(self,
-                       method: Union[str, Callable],
-                       timeout: Optional[float] = None,
-                       args: Tuple = (),
-                       kwargs: Optional[Dict] = None) -> List[Any]:
+    def collective_rpc(
+        self,
+        method: Union[str, Callable],
+        timeout: Optional[float] = None,
+        args: Tuple = (),
+        kwargs: Optional[Dict] = None,
+    ) -> List[Any]:
         return self._run_workers(method, *args, **(kwargs or {}))
 
     @abstractmethod
@@ -320,7 +331,7 @@ class DistributedExecutorBase(ExecutorBase):
                 run only in the remote TP workers, not the driver worker.
                 It will also be run asynchronously and return a list of futures
                 rather than blocking on the results.
-        
+
         # TODO: simplify and merge with collective_rpc
         """
         raise NotImplementedError
@@ -332,12 +343,13 @@ class DistributedExecutorBase(ExecutorBase):
         raise NotImplementedError
 
     async def execute_model_async(
-            self,
-            execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
+        self, execute_model_req: ExecuteModelRequest
+    ) -> List[SamplerOutput]:
         if self.parallel_worker_tasks is None:
             # Start model execution loop running in the parallel workers
             self.parallel_worker_tasks = asyncio.create_task(
-                self._start_worker_execution_loop())
+                self._start_worker_execution_loop()
+            )
 
         # Only the driver worker returns the sampling results.
         return await self._driver_execute_model_async(execute_model_req)
