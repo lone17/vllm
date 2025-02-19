@@ -1,3 +1,4 @@
+import gc
 from dataclasses import dataclass
 from typing import Dict, Optional, Union
 
@@ -117,7 +118,7 @@ class LayerNormWithSteering(nn.Module):
         )
 
         self.proj_matrices[index] = proj_matrix
-        self.rotated_components[index] = torch.tensor(rotated_component)
+        self.rotated_components[index] = rotated_component
 
     def reset_control_vector(self, index: int):
         """Reset a control vector to zero at a specific index."""

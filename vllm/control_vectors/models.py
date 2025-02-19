@@ -143,21 +143,23 @@ class ControlVectorModel(AdapterModel):
             elif file_path.endswith(".npy"):
                 steering_configs = np.load(file_path, allow_pickle=True).item()
 
-                for module_name, config in steering_configs.items():
+                for module_name, layer_config in steering_configs.items():
                     if not module_name.startswith("model."):
                         module_name = f"model.{module_name}"
 
                     steering_configs[module_name] = SteererWeights(
-                        first_direction=torch.from_numpy(config["first_direction"]).to(
-                            device
-                        ),
+                        first_direction=torch.from_numpy(
+                            layer_config["first_direction"]
+                        ).to(device),
                         second_direction=(
-                            torch.from_numpy(config["second_direction"]).to(device)
-                            if "second_direction" in config
+                            torch.from_numpy(layer_config["second_direction"]).to(
+                                device
+                            )
+                            if "second_direction" in layer_config
                             else None
                         ),
-                        scale_factor=config.get("scale_factor", scale_factor),
-                        target_degree=config.get("angle", target_degree),
+                        scale_factor=layer_config.get("scale_factor", scale_factor),
+                        target_degree=layer_config.get("angle", target_degree),
                     )
 
             return cls(control_vector_id, steering_configs)
@@ -323,6 +325,7 @@ class ControlVectorLRUCache(AdapterLRUCache[ControlVectorModel]):
 
 
 class LRUCacheControlVectorModelManager(ControlVectorModelManager):
+    """A model manager that manages multiple control_vectors with  LRU cache"""
 
     def __init__(self, model: nn.Module, control_vector_config: ControlVectorConfig):
         self.control_vector_config = control_vector_config
@@ -337,6 +340,18 @@ class LRUCacheControlVectorModelManager(ControlVectorModelManager):
     def list_adapters(self) -> Dict[int, ControlVectorModel]:
         """List all registered ControlVectorModel."""
         return dict(self._registered_adapters.cache)
+
+    def add_adapter(self, control_vector: ControlVectorModel) -> bool:
+        """Add a ControlVectorModel to the manager."""
+        if control_vector.id not in self._registered_adapters:
+            self._add_adapter(control_vector)
+            was_added = True
+        else:
+            # We always touch to update the LRU cache order
+            self._registered_adapters.touch(control_vector.id)
+            was_added = False
+
+        return was_added
 
     def activate_adapter(
         self,
@@ -358,8 +373,28 @@ class LRUCacheControlVectorModelManager(ControlVectorModelManager):
             return True
         return False
 
+    def pin_adapter(self, control_vector_id: int) -> bool:
+        """Pin a PromptAdapterModel in the manager cache."""
+        self._pin_control_vector_in_cpu_cache(control_vector_id)
+        self._pin_control_vector_in_gpu_cache(control_vector_id)
+        return True
 
-def create_cv_manager(
+    def _pin_control_vector_in_cpu_cache(self, control_vector_id: int):
+        try:
+            self._registered_adapters.pin(control_vector_id)
+        except ValueError as err:
+            raise ValueError(
+                f"Pinning failed. Control Vector {control_vector_id} is not registered."
+            ) from err
+
+    def _pin_control_vector_in_gpu_cache(self, control_vector_id: int):
+        if control_vector_id not in self._active_adapters:
+            # move adapter to gpu if not already active
+            self.activate_adapter(control_vector_id)
+        self._active_adapters.pin(control_vector_id)
+
+
+def create_control_vector_manager(
     model: nn.Module,
     control_vector_config: ControlVectorConfig,
     control_vector_manager_cls: Type[

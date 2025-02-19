@@ -15,7 +15,7 @@ from vllm.control_vectors.models import (
     ControlVectorModel,
     ControlVectorModelManager,
     LRUCacheControlVectorModelManager,
-    create_cv_manager,
+    create_control_vector_manager,
 )
 from vllm.control_vectors.request import ControlVectorRequest
 
@@ -51,7 +51,7 @@ class WorkerControlVectorManager(AbstractWorkerManager):
         self,
         model: torch.nn.Module,
     ) -> Any:
-        control_vector_manager = create_cv_manager(
+        control_vector_manager = create_control_vector_manager(
             model,
             control_vector_config=self.control_vector_config,
             control_vector_manager_cls=self._manager_cls,
@@ -90,6 +90,7 @@ class WorkerControlVectorManager(AbstractWorkerManager):
 
     def set_active_adapters(self, requests: Set[Any]) -> None:
         assert len(requests) <= 1, "No more than 1 control vector at a time"
+
         mapping = next((request.adapter_id for request in requests), None)
         set_active_adapters_worker(
             requests,
@@ -143,7 +144,7 @@ class LRUCacheWorkerControlVectorManager(WorkerControlVectorManager):
         self,
         model: torch.nn.Module,
     ) -> Any:
-        control_vector_manager = create_cv_manager(
+        control_vector_manager = create_control_vector_manager(
             model,
             control_vector_config=self.control_vector_config,
             control_vector_manager_cls=self._control_vector_manager_cls,
