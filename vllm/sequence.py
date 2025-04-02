@@ -418,6 +418,7 @@ class Sequence:
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
     ) -> None:
         self.seq_id = seq_id
         self.inputs = SingletonInputsAdapter(inputs)
@@ -425,6 +426,7 @@ class Sequence:
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
+        self.control_vector_request = control_vector_request
 
         self.data = SequenceData.from_seqs(self.prompt_token_ids)
         self.output_logprobs: SampleLogprobs = []
@@ -484,6 +486,14 @@ class Sequence:
         return (
             self.prompt_adapter_request.prompt_adapter_id
             if self.prompt_adapter_request
+            else 0
+        )
+
+    @property
+    def control_vector_id(self) -> int:
+        return (
+            self.control_vector_request.control_vector_id
+            if self.control_vector_request
             else 0
         )
 
@@ -664,8 +674,8 @@ class SequenceGroup:
         encoder_seq: Optional[Sequence] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        priority: int = 0,
         control_vector_request: Optional[ControlVectorRequest] = None,
+        priority: int = 0,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
@@ -765,6 +775,14 @@ class SequenceGroup:
         return (
             self.prompt_adapter_request.prompt_adapter_num_virtual_tokens
             if self.prompt_adapter_request
+            else 0
+        )
+
+    @property
+    def control_vector_id(self) -> int:
+        return (
+            self.control_vector_request.control_vector_id
+            if self.control_vector_request
             else 0
         )
 
@@ -1037,6 +1055,12 @@ class SequenceGroupMetadata(
             else 0
         )
 
+    @property
+    def control_vector_id(self) -> int:
+        return (
+            self.control_vector_request.adapter_id if self.control_vector_request else 0
+        )
+
     # Multi-Step Chunked-Prefill property
     @property
     def is_single_step_prompt(self) -> bool:
@@ -1050,12 +1074,6 @@ class SequenceGroupMetadata(
         # This is an efficient way of fetching the seq_id when
         # we know this SequenceGroup has only one sequence.
         return next(iter(self.seq_data))
-
-    @property
-    def control_vector_id(self) -> int:
-        return (
-            self.control_vector_request.adapter_id if self.control_vector_request else 0
-        )
 
     def apply_delta(self, sequence_group_metadata_delta: SequenceGroupMetadataDelta):
         for id, delta in sequence_group_metadata_delta.seq_data_delta.items():
@@ -1503,6 +1521,7 @@ class ParallelSampleSequenceGroup(SequenceGroupBase):
             encoder_seq=seq_group.encoder_seq,
             trace_headers=seq_group.trace_headers,
             prompt_adapter_request=seq_group.prompt_adapter_request,
+            control_vector_request=seq_group.control_vector_request,
             priority=seq_group.priority,
         )
 

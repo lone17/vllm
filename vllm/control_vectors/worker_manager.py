@@ -71,6 +71,7 @@ class WorkerControlVectorManager(AbstractWorkerManager):
                 scale_factor=control_vector_request.scale_factor,
                 target_degree=control_vector_request.target_degree,
                 keep_norm=control_vector_request.keep_norm,
+                adaptive_mode=control_vector_request.adaptive_mode,
             )
         except Exception as e:
             raise RuntimeError(

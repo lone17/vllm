@@ -60,9 +60,9 @@ class MLPWithControlVector(BaseLayerWithControlVector):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with optional application of control vectors."""
-        print(hidden_states.shape)
+        # print(hidden_states.shape)
         hidden_states = self.base_layer(hidden_states)
-        print("  ", hidden_states.shape)
+        # print("  ", hidden_states.shape)
         cv = self.control_vectors.get(self.active_index)
 
         if cv is not None and cv.numel() > 0:
@@ -79,10 +79,22 @@ class LayerNormWithSteering(nn.Module):
     def __init__(self, base_layer) -> None:
         super().__init__()
         self.base_layer = base_layer
-        self.proj_matrices: dict[int, torch.Tensor] = {}  # u@u^T + v@v^T
-        self.rotated_components: dict[int, torch.Tensor] = (
-            {}
-        )  # [u v] @ R_theta @ [1 0]^T
+
+        # u (normalized)
+        self.first_directions: dict[int, torch.Tensor] = {}
+
+        # v (normalzied)
+        self.second_directions: dict[int, torch.Tensor] = {}  # v
+
+        # 0: not adaptive, 1: adaptive to 1st direction, 2: adaptive to 2nd direction
+        self.adaptive_mode: dict[int, int] = {}
+
+        # u@u^T + v@v^T
+        self.proj_matrices: dict[int, torch.Tensor] = {}
+
+        # [u v] @ R_theta @ [1 0]^T
+        self.rotated_components: dict[int, torch.Tensor] = {}
+
         self.active_index: float = None
 
     def set_control_vector(self, index, steer_weights: SteererWeights) -> None:
@@ -97,6 +109,10 @@ class LayerNormWithSteering(nn.Module):
         u = first_direction / first_direction.norm()
         v = second_direction - (second_direction @ u) * u
         v /= v.norm()
+
+        self.first_directions[index] = u
+        self.second_directions[index] = second_direction / second_direction.norm()
+        self.adaptive_mode[index] = steer_weights.adaptive_mode
 
         theta = np.deg2rad(target_degree)
         cos_theta = np.cos(theta)
@@ -149,11 +165,26 @@ class LayerNormWithSteering(nn.Module):
             rotated_component = self.rotated_components[self.active_index].to(
                 device, dtype=dtype
             )
+            adaptive_mode = self.adaptive_mode[self.active_index]
 
             Px = hidden_states @ proj_matrix
             scale = Px.norm(dim=-1, keepdim=True)
 
-            hidden_states = hidden_states - Px + scale * rotated_component
+            if adaptive_mode == 0:
+                hidden_states += -Px + scale * rotated_component
+            else:
+                if adaptive_mode == 1:
+                    feature_direction = self.first_directions[self.active_index]
+                elif adaptive_mode == 2:
+                    feature_direction = self.second_directions[self.active_index]
+                else:
+                    raise ValueError(f"Invalid adaptive mode: {adaptive_mode}")
+
+                feature_direction = feature_direction.to(device, dtype=dtype)
+                proj_to_feature_direction = hidden_states @ feature_direction
+                mask = proj_to_feature_direction > 0
+
+                hidden_states += mask.unsqueeze(1) * (scale * rotated_component - Px)
 
         if residual is None:
             return hidden_states

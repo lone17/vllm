@@ -317,10 +317,10 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         guided_options_request: Optional[
             Union[LLMGuidedOptions, GuidedDecodingRequest]
         ] = None,
-        control_vector_request: Optional[ControlVectorRequest] = None,
     ) -> List[RequestOutput]: ...
 
     @overload  # LEGACY: single (prompt + optional token ids)
@@ -333,6 +333,7 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         guided_options_request: Optional[
             Union[LLMGuidedOptions, GuidedDecodingRequest]
         ] = None,
@@ -348,6 +349,7 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         guided_options_request: Optional[
             Union[LLMGuidedOptions, GuidedDecodingRequest]
         ] = None,
@@ -364,6 +366,7 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         guided_options_request: Optional[
             Union[LLMGuidedOptions, GuidedDecodingRequest]
         ] = None,
@@ -380,6 +383,7 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         guided_options_request: Optional[
             Union[LLMGuidedOptions, GuidedDecodingRequest]
         ] = None,
@@ -395,6 +399,7 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         guided_options_request: Optional[
             Union[LLMGuidedOptions, GuidedDecodingRequest]
         ] = None,
@@ -417,11 +422,11 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         guided_options_request: Optional[
             Union[LLMGuidedOptions, GuidedDecodingRequest]
         ] = None,
         priority: Optional[List[int]] = None,
-        control_vector_request: Optional[ControlVectorRequest] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -1386,8 +1391,8 @@ class LLM:
             params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
-            priority=priority,
             control_vector_request=control_vector_request,
+            priority=priority,
         )
 
     def _add_guided_params(

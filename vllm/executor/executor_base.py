@@ -45,8 +45,8 @@ class ExecutorBase(ABC):
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
-        self.observability_config = vllm_config.observability_config
         self.control_vector_config = vllm_config.control_vector_config
+        self.observability_config = vllm_config.observability_config
         self._init_executor()
         self.is_sleeping = False
 
@@ -189,6 +189,27 @@ class ExecutorBase(ABC):
             assert s == sets[0], "All workers should have the same prompt adapters."
         return sets[0]
 
+    def add_control_vector(self, control_vector_request: ControlVectorRequest) -> bool:
+        assert (
+            control_vector_request.adapter_id > 0
+        ), "control_vector_id must be greater than 0."
+        return all(
+            self.collective_rpc("add_control_vector", args=(control_vector_request,))
+        )
+
+    def remove_control_vector(self, cv_id: int) -> bool:
+        raise NotImplementedError
+
+    def pin_control_vector(self, cv_id: int) -> bool:
+        assert cv_id > 0, "control_vector_id must be greater than 0."
+        return all(self.collective_rpc("pin_control_vector", args=(cv_id,)))
+
+    def list_control_vectors(self) -> Set[int]:
+        sets = self.collective_rpc("list_control_vectors")
+        for s in sets:
+            assert s == sets[0], "All workers should have the same control vectors."
+        return sets[0]
+
     def start_profile(self) -> None:
         self.collective_rpc("start_profile")
 
@@ -219,13 +240,6 @@ class ExecutorBase(ABC):
             "save_sharded_state",
             kwargs=dict(path=path, pattern=pattern, max_size=max_size),
         )
-
-    def add_control_vector(self, control_vector_request: ControlVectorRequest) -> bool:
-        assert control_vector_request.adapter_id > 0
-        return self.driver_worker.add_control_vector(control_vector_request)
-
-    def remove_control_vector(self, cv_id: int) -> bool:
-        return self.driver_worker.add_control_vector(cv_id)
 
     @abstractmethod
     def check_health(self) -> None:

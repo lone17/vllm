@@ -88,6 +88,7 @@ class ControlVectorModel(AdapterModel):
         target_degree: float = 0.0,
         scale_factor: float = 1.0,
         keep_norm: bool = False,
+        adaptive_mode: int = 0,
     ) -> "ControlVectorModel":
 
         try:
@@ -160,6 +161,7 @@ class ControlVectorModel(AdapterModel):
                         ),
                         scale_factor=layer_config.get("scale_factor", scale_factor),
                         target_degree=layer_config.get("angle", target_degree),
+                        adaptive_mode=layer_config.get("adaptive_mode", adaptive_mode),
                     )
 
             return cls(control_vector_id, steering_configs)

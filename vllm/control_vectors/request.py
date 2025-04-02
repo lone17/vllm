@@ -15,6 +15,7 @@ class ControlVectorRequest(AdapterRequest):
     scale: float = 1.0
     target_degree: float = 0.0
     keep_norm: bool = False
+    adaptive_mode: int = 0
 
     def __hash__(self):
         return super().__hash__()
