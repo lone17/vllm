@@ -267,16 +267,16 @@ def get_hf_file_to_dict(file_name: str,
                         model: Union[str, Path],
                         revision: Optional[str] = 'main'):
     """
-    Downloads a file from the Hugging Face Hub and returns 
+    Downloads a file from the Hugging Face Hub and returns
     its contents as a dictionary.
 
     Parameters:
     - file_name (str): The name of the file to download.
     - model (str): The name of the model on the Hugging Face Hub.
-    - revision (str): The specific version of the model. 
+    - revision (str): The specific version of the model.
 
     Returns:
-    - config_dict (dict): A dictionary containing 
+    - config_dict (dict): A dictionary containing
     the contents of the downloaded file.
     """
     file_path = Path(model) / file_name
@@ -311,17 +311,17 @@ def get_hf_file_to_dict(file_name: str,
 
 def get_pooling_config(model: str, revision: Optional[str] = 'main'):
     """
-    This function gets the pooling and normalize 
-    config from the model - only applies to 
-    sentence-transformers models. 
+    This function gets the pooling and normalize
+    config from the model - only applies to
+    sentence-transformers models.
 
     Args:
         model (str): The name of the Hugging Face model.
-        revision (str, optional): The specific version 
+        revision (str, optional): The specific version
         of the model to use. Defaults to 'main'.
 
     Returns:
-        dict: A dictionary containing the pooling 
+        dict: A dictionary containing the pooling
         type and whether normalization is used.
     """
 
@@ -380,17 +380,17 @@ def get_sentence_transformer_tokenizer_config(model: str,
                                               revision: Optional[str] = 'main'
                                               ):
     """
-    Returns the tokenization configuration dictionary for a 
+    Returns the tokenization configuration dictionary for a
     given Sentence Transformer BERT model.
 
     Parameters:
-    - model (str): The name of the Sentence Transformer 
+    - model (str): The name of the Sentence Transformer
     BERT model.
     - revision (str, optional): The revision of the m
     odel to use. Defaults to 'main'.
 
     Returns:
-    - dict: A dictionary containing the configuration parameters 
+    - dict: A dictionary containing the configuration parameters
     for the Sentence Transformer BERT model.
     """
     for config_name in [

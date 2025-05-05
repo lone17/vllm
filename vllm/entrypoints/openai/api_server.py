@@ -752,15 +752,17 @@ async def init_app_state(
 
     resolved_chat_template = load_chat_template(args.chat_template)
     logger.info("Using supplied chat template:\n%s", resolved_chat_template)
-
     state.openai_serving_models = OpenAIServingModels(
         engine_client=engine_client,
         model_config=model_config,
         base_model_paths=base_model_paths,
         lora_modules=args.lora_modules,
+        steering_config_paths=args.steering_config_path,
         prompt_adapters=args.prompt_adapters,
     )
+    # Init LoRA
     await state.openai_serving_models.init_static_loras()
+    await state.openai_serving_models.init_steering()
     state.openai_serving_chat = OpenAIServingChat(
         engine_client,
         model_config,
@@ -870,10 +872,15 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # sam: init the model
     async with build_async_engine_client(args) as engine_client:
         app = build_app(args)
 
         model_config = await engine_client.get_model_config()
+        # sam: loaded lora
+        # INFO 04-21 15:45:33 api_server.py:754] Using supplied chat template:
+        # INFO 04-21 15:45:33 api_server.py:754] None
+        # INFO 04-21 15:45:34 serving_models.py:172] Loaded new LoRA adapter: name 'instruct_tuned', path '/home/sam/.cache/huggingface/hub/models--bun
         await init_app_state(engine_client, model_config, app.state, args)
 
         shutdown_task = await serve_http(

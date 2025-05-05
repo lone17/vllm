@@ -12,6 +12,7 @@ from vllm.entrypoints.openai.protocol import (ErrorResponse,
                                               ModelPermission,
                                               UnloadLoraAdapterRequest)
 from vllm.logger import init_logger
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.utils import AtomicCounter
@@ -38,6 +39,16 @@ class LoRAModulePath:
     base_model_name: Optional[str] = None
 
 
+@dataclass
+class SteeringConfigPath:
+    name: str
+    local_path: str
+    adaptive_mode: int = 0
+    scale: float = 10.0
+    target_degree: float = 170.0
+    keep_norm: bool = False
+
+
 class OpenAIServingModels:
     """Shared instance to hold data about the loaded base model(s) and adapters.
 
@@ -55,12 +66,17 @@ class OpenAIServingModels:
         *,
         lora_modules: Optional[List[LoRAModulePath]] = None,
         prompt_adapters: Optional[List[PromptAdapterPath]] = None,
+        steering_config_paths: Optional[List[SteeringConfigPath]] = None,
     ):
         super().__init__()
 
         self.base_model_paths = base_model_paths
         self.max_model_len = model_config.max_model_len
         self.engine_client = engine_client
+
+        self.control_vector_requests: List[ControlVectorRequest] = []
+        self.control_vector_id_counter = AtomicCounter(0)
+        self.steering_config_paths = steering_config_paths
 
         self.static_lora_modules = lora_modules
         self.lora_requests: List[LoRARequest] = []
@@ -93,6 +109,22 @@ class OpenAIServingModels:
             if isinstance(load_result, ErrorResponse):
                 raise ValueError(load_result.message)
 
+    async def init_steering(self):
+        if self.steering_config_paths is None:
+            return
+        for steering_config in self.steering_config_paths:
+            unique_id = self.control_vector_id_counter.inc(1)
+            load_request = ControlVectorRequest(
+            control_vector_name=steering_config.name,
+            control_vector_id=unique_id,
+            control_vector_local_path=steering_config.local_path,
+            scale=int(steering_config.scale),
+            target_degree=float(steering_config.target_degree),
+            keep_norm=True if steering_config.keep_norm == "True" else False,
+            adaptive_mode=int(steering_config.adaptive_mode),
+        )
+            self.control_vector_requests.append(load_request)
+
     def is_base_model(self, model_name):
         return any(model.name == model_name for model in self.base_model_paths)
 
@@ -109,7 +141,7 @@ class OpenAIServingModels:
         return self.base_model_paths[0].name
 
     async def show_available_models(self) -> ModelList:
-        """Show available models. This includes the base model and all 
+        """Show available models. This includes the base model and all
         adapters"""
         model_cards = [
             ModelCard(id=base_model.name,
@@ -132,8 +164,16 @@ class OpenAIServingModels:
                       permission=[ModelPermission()])
             for prompt_adapter in self.prompt_adapter_requests
         ]
+        control_vector_cards = [
+            ModelCard(id=control_vector.name,
+                      root=control_vector.local_path,
+                      parent=self.base_model_paths[0].name,
+                      permission=[ModelPermission()])
+            for control_vector in self.control_vector_requests
+        ]
         model_cards.extend(lora_cards)
         model_cards.extend(prompt_adapter_cards)
+        model_cards.extend(control_vector_cards)
         return ModelList(data=model_cards)
 
     async def load_lora_adapter(

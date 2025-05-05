@@ -134,6 +134,7 @@ class OpenAIServingChat(OpenAIServing):
             (
                 lora_request,
                 prompt_adapter_request,
+                control_vector_request,
             ) = self._maybe_get_adapters(request)
 
             model_name = self.models.model_name(lora_request)
@@ -221,7 +222,8 @@ class OpenAIServingChat(OpenAIServing):
                                  request_prompts[i],
                                  params=sampling_params,
                                  lora_request=lora_request,
-                                 prompt_adapter_request=prompt_adapter_request)
+                                 prompt_adapter_request=prompt_adapter_request,
+                                 control_vector_request=control_vector_request)
 
                 trace_headers = (None if raw_request is None else await
                                  self._get_trace_headers(raw_request.headers))
@@ -237,6 +239,7 @@ class OpenAIServingChat(OpenAIServing):
                         engine_prompt,
                         sampling_params,
                         request_id,
+                        control_vector_request=control_vector_request,
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         prompt_adapter_request=prompt_adapter_request,
@@ -675,7 +678,6 @@ class OpenAIServingChat(OpenAIServing):
 
         created_time = int(time.time())
         final_res: Optional[RequestOutput] = None
-
         try:
             async for res in result_generator:
                 final_res = res
@@ -924,8 +926,8 @@ class OpenAIServingChat(OpenAIServing):
         """
             Utility function to check if streamed tokens should go through the
             reasoning parser that was configured.
-    
-            We only want to do this IF reasoning is enabled and a reasoning 
+
+            We only want to do this IF reasoning is enabled and a reasoning
             parser is configured.
             """
         return self.enable_reasoning and self.reasoning_parser is not None

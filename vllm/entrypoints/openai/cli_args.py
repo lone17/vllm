@@ -14,7 +14,8 @@ from vllm.entrypoints.chat_utils import (ChatTemplateContentFormatOption,
                                          validate_chat_template)
 from vllm.entrypoints.openai.reasoning_parsers import ReasoningParserManager
 from vllm.entrypoints.openai.serving_models import (LoRAModulePath,
-                                                    PromptAdapterPath)
+                                                    PromptAdapterPath,
+                                                    SteeringConfigPath,)
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.utils import FlexibleArgumentParser
 
@@ -73,6 +74,35 @@ class PromptAdapterParserAction(argparse.Action):
         for item in values:
             name, path = item.split('=')
             adapter_list.append(PromptAdapterPath(name, path))
+        setattr(namespace, self.dest, adapter_list)
+
+
+class SteeringConfigParserAction(argparse.Action):
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Optional[Union[str, Sequence[str]]],
+        option_string: Optional[str] = None,
+    ):
+        if values is None:
+            values = []
+        if isinstance(values, str):
+            raise TypeError("Expected values to be a list")
+
+        adapter_list: List[SteeringConfigPath] = []
+        for item in values:
+            kwargs = {}
+            item_values = item.split(";")
+            for item_value in item_values:
+                if '=' not in item_value:
+                    parser.error(
+                        f"Invalid format for --steering-config-path: {value}"
+                    )
+                key, value = item_value.split('=')
+                kwargs[key] = value
+            adapter_list.append(SteeringConfigPath(**kwargs))
         setattr(namespace, self.dest, adapter_list)
 
 
@@ -247,7 +277,27 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Special the tool parser plugin write to parse the model-generated tool"
         " into OpenAI API format, the name register in this plugin can be used "
         "in ``--tool-call-parser``.")
-
+    parser.add_argument(
+        "--steering-config-path",
+        type=nullable_str,
+        default=None,
+        nargs='+',
+        action=SteeringConfigParserAction,
+        help="The file path to the steering config file. "
+    )
+    parser.add_argument(
+            "--steering-angular",
+            type=int,
+            default=180,
+            help="The angular position used to steer Activation vectors.",
+    )
+    parser.add_argument(
+            "--control-vector-adaptive",
+            type=int,
+            default=0,
+            help="Control vector adaptive steering. Three modes are 0, 1, 2. ",
+    )
+    
     parser = AsyncEngineArgs.add_cli_args(parser)
 
     parser.add_argument('--max-log-len',
@@ -270,7 +320,6 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="If set to True, enable prompt_tokens_details in usage.")
 
     return parser
-
 
 def validate_parsed_serve_args(args: argparse.Namespace):
     """Quick checks for model serve args that raise prior to loading."""

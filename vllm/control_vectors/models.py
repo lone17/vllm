@@ -327,7 +327,7 @@ class ControlVectorLRUCache(AdapterLRUCache[ControlVectorModel]):
 
 
 class LRUCacheControlVectorModelManager(ControlVectorModelManager):
-    """A model manager that manages multiple control_vectors with  LRU cache"""
+    """A model manager that manages multiple control_vectors with LRU cache"""
 
     def __init__(self, model: nn.Module, control_vector_config: ControlVectorConfig):
         self.control_vector_config = control_vector_config

@@ -33,6 +33,7 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCUProfileRequest)
 from vllm.engine.protocol import EngineClient
 # yapf: enable
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.envs import VLLM_RPC_TIMEOUT
 from vllm.inputs import PromptType
 from vllm.inputs.preprocess import InputPreprocessor
@@ -186,6 +187,7 @@ class MQLLMEngineClient(EngineClient):
                 # Poll, checking for ENGINE_DEAD
                 while await self.output_socket.poll(timeout=VLLM_RPC_TIMEOUT
                                                     ) == 0:
+
                     logger.debug("Waiting for output from MQLLMEngine.")
 
                     # If errored, alert all running requests.
@@ -467,6 +469,7 @@ class MQLLMEngineClient(EngineClient):
         prompt: Optional[PromptType] = None,
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
@@ -499,6 +502,7 @@ class MQLLMEngineClient(EngineClient):
                 and request_id is not None)
 
         return self._process_request(prompt, sampling_params, request_id,
+                                     control_vector_request,
                                      lora_request, trace_headers,
                                      prompt_adapter_request, priority)
 
@@ -508,6 +512,7 @@ class MQLLMEngineClient(EngineClient):
         prompt: PromptType,
         pooling_params: PoolingParams,
         request_id: str,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
@@ -522,6 +527,7 @@ class MQLLMEngineClient(EngineClient):
         inputs: PromptType,
         pooling_params: PoolingParams,
         request_id: str,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
@@ -537,6 +543,7 @@ class MQLLMEngineClient(EngineClient):
         prompt: Optional[PromptType] = None,
         pooling_params: Optional[PoolingParams] = None,
         request_id: Optional[str] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
@@ -572,6 +579,7 @@ class MQLLMEngineClient(EngineClient):
                                   pooling_params,
                                   request_id,
                                   lora_request,
+                                  control_vector_request,
                                   trace_headers,
                                   priority=priority))
 
@@ -580,6 +588,7 @@ class MQLLMEngineClient(EngineClient):
         prompt: PromptType,
         params: Union[SamplingParams, PoolingParams],
         request_id: str,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
@@ -627,7 +636,6 @@ class MQLLMEngineClient(EngineClient):
                 lp_bytes = cloudpickle.dumps(logits_processors)
             else:
                 lp_bytes = None
-
             request_bytes = pickle.dumps(
                 RPCProcessRequest(
                     prompt=prompt,
@@ -637,6 +645,7 @@ class MQLLMEngineClient(EngineClient):
                     trace_headers=trace_headers,
                     prompt_adapter_request=prompt_adapter_request,
                     priority=priority,
+                    control_vector_request=control_vector_request,
                 ))
 
             # 3) Send the RPCGenerateRequest to the MQLLMEngine.
@@ -683,6 +692,7 @@ class MQLLMEngineClient(EngineClient):
             request=RPCResetPrefixCacheRequest.RESET_PREFIX_CACHE,
             socket=self.input_socket)
 
+    # sam: add LoRA
     async def add_lora(self, lora_request: LoRARequest) -> None:
         """Load a new LoRA adapter into the engine for future requests."""
         # Uses the same I/O as generate requests
