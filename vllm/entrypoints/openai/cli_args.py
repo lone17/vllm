@@ -94,15 +94,16 @@ class SteeringConfigParserAction(argparse.Action):
         adapter_list: List[SteeringConfigPath] = []
         for item in values:
             kwargs = {}
-            item_values = item.split(";")
-            for item_value in item_values:
-                if '=' not in item_value:
-                    parser.error(
-                        f"Invalid format for --steering-config-path: {value}"
-                    )
-                key, value = item_value.split('=')
-                kwargs[key] = value
-            adapter_list.append(SteeringConfigPath(**kwargs))
+            try:
+                steering_dict = json.loads(item)
+                adapter_list.append(SteeringConfigPath(**steering_dict))
+            except json.JSONDecodeError:
+                parser.error(
+                    f"Invalid JSON format for --steering-config-path: {item}")
+            except TypeError as e:
+                parser.error(
+                    f"Invalid fields for --steering-config-path: {item} - {str(e)}"
+                )
         setattr(namespace, self.dest, adapter_list)
 
 
@@ -297,7 +298,7 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
             default=0,
             help="Control vector adaptive steering. Three modes are 0, 1, 2. ",
     )
-    
+
     parser = AsyncEngineArgs.add_cli_args(parser)
 
     parser.add_argument('--max-log-len',

@@ -120,7 +120,7 @@ class OpenAIServingModels:
             control_vector_local_path=steering_config.local_path,
             scale=int(steering_config.scale),
             target_degree=float(steering_config.target_degree),
-            keep_norm=True if steering_config.keep_norm == "True" else False,
+            keep_norm=steering_config.keep_norm,
             adaptive_mode=int(steering_config.adaptive_mode),
         )
             self.control_vector_requests.append(load_request)
