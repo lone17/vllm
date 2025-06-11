@@ -591,9 +591,9 @@ class LLMEngine:
         arrival_time: float,
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
+        control_vector_request: ControlVectorRequest = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
-        control_vector_request: ControlVectorRequest = None,
     ) -> Optional[SequenceGroup]:
         """Add a processed request to the engine's request pool.
         return the created sequence group.
@@ -608,6 +608,7 @@ class LLMEngine:
                 lora_request=lora_request,
                 trace_headers=trace_headers,
                 prompt_adapter_request=prompt_adapter_request,
+                control_vector_request=control_vector_request,
                 priority=priority,
             )
             return None
@@ -632,6 +633,7 @@ class LLMEngine:
             eos_token_id,
             lora_request,
             prompt_adapter_request,
+            control_vector_request,
         )
 
         encoder_seq = (
@@ -644,6 +646,7 @@ class LLMEngine:
                 eos_token_id,
                 lora_request,
                 prompt_adapter_request,
+                control_vector_request,
             )
         )
 
@@ -657,9 +660,9 @@ class LLMEngine:
                 lora_request=lora_request,
                 trace_headers=trace_headers,
                 prompt_adapter_request=prompt_adapter_request,
+                control_vector_request=control_vector_request,
                 encoder_seq=encoder_seq,
                 priority=priority,
-                control_vector_request=control_vector_request,
             )
         elif isinstance(params, PoolingParams):
             seq_group = self._create_sequence_group_with_pooling(
@@ -669,9 +672,9 @@ class LLMEngine:
                 arrival_time=arrival_time,
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
+                control_vector_request=control_vector_request,
                 encoder_seq=encoder_seq,
                 priority=priority,
-                control_vector_request=control_vector_request,
             )
         else:
             raise ValueError("Either SamplingParams or PoolingParams must be provided.")
@@ -698,8 +701,8 @@ class LLMEngine:
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        priority: int = 0,
         control_vector_request: Optional[ControlVectorRequest] = None,
+        priority: int = 0,
     ) -> None: ...
 
     @overload
@@ -714,8 +717,8 @@ class LLMEngine:
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        priority: int = 0,
         control_vector_request: Optional[ControlVectorRequest] = None,
+        priority: int = 0,
     ) -> None: ...
 
     @deprecate_kwargs(
@@ -731,8 +734,8 @@ class LLMEngine:
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        priority: int = 0,
         control_vector_request: Optional[ControlVectorRequest] = None,
+        priority: int = 0,
         *,
         inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> None:
@@ -828,9 +831,9 @@ class LLMEngine:
             arrival_time=arrival_time,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
+            control_vector_request=control_vector_request,
             trace_headers=trace_headers,
             priority=priority,
-            control_vector_request=control_vector_request,
         )
 
     def _validate_token_prompt(self, prompt: PromptType, tokenizer: AnyTokenizer):
@@ -863,9 +866,9 @@ class LLMEngine:
         lora_request: Optional[LoRARequest],
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         encoder_seq: Optional[Sequence] = None,
         priority: int = 0,
-        control_vector_request: ControlVectorRequest = None,
     ) -> SequenceGroup:
         """Creates a SequenceGroup with SamplingParams."""
         max_logprobs = self.get_model_config().max_logprobs
@@ -894,9 +897,9 @@ class LLMEngine:
             lora_request=lora_request,
             trace_headers=trace_headers,
             prompt_adapter_request=prompt_adapter_request,
+            control_vector_request=control_vector_request,
             encoder_seq=encoder_seq,
             priority=priority,
-            control_vector_request=control_vector_request,
         )
 
         return seq_group
@@ -909,9 +912,9 @@ class LLMEngine:
         arrival_time: float,
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
+        control_vector_request: Optional[ControlVectorRequest] = None,
         encoder_seq: Optional[Sequence] = None,
         priority: int = 0,
-        control_vector_request: ControlVectorRequest = None,
     ) -> SequenceGroup:
         """Creates a SequenceGroup with PoolingParams."""
         # Defensive copy of PoolingParams, which are used by the pooler
@@ -924,9 +927,9 @@ class LLMEngine:
             lora_request=lora_request,
             pooling_params=pooling_params,
             prompt_adapter_request=prompt_adapter_request,
+            control_vector_request=control_vector_request,
             encoder_seq=encoder_seq,
             priority=priority,
-            control_vector_request=control_vector_request,
         )
         return seq_group
 
@@ -1965,6 +1968,15 @@ class LLMEngine:
 
     def list_prompt_adapters(self) -> List[int]:
         return self.model_executor.list_prompt_adapters()
+
+    def add_control_vector(self, control_vector_request: ControlVectorRequest) -> bool:
+        return self.model_executor.add_control_vector(control_vector_request)
+
+    def remove_control_vector(self, control_vector_id: int) -> bool:
+        return self.model_executor.remove_control_vector(control_vector_id)
+
+    def list_control_vectors(self) -> List[int]:
+        return self.model_executor.list_control_vectors()
 
     def start_profile(self) -> None:
         self.model_executor.start_profile()

@@ -6,6 +6,7 @@ from typing import List, Mapping, Optional, Union, overload
 from typing_extensions import deprecated
 
 from vllm import PoolingParams
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.inputs import PromptType
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
@@ -33,6 +34,7 @@ class RPCProcessRequest:
     lora_request: Optional[LoRARequest] = None
     trace_headers: Optional[Mapping[str, str]] = None
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
+    control_vector_request: Optional[ControlVectorRequest] = None
     priority: int = 0
 
     @overload
@@ -44,9 +46,9 @@ class RPCProcessRequest:
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         priority: int = 0,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     @deprecated("'inputs' will be renamed to 'prompt")
@@ -59,30 +61,30 @@ class RPCProcessRequest:
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         priority: int = 0,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @deprecate_kwargs(
         "inputs",
         additional_message="Please use the 'prompt' parameter instead.",
     )
     def __init__(
-            self,
-            prompt: Optional[PromptType] = None,
-            params: Optional[Union[SamplingParams, PoolingParams]] = None,
-            request_id: Optional[str] = None,
-            lora_request: Optional[LoRARequest] = None,
-            trace_headers: Optional[Mapping[str, str]] = None,
-            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-            priority: int = 0,
-            *,
-            inputs: Optional[PromptType] = None,  # DEPRECATED
+        self,
+        prompt: Optional[PromptType] = None,
+        params: Optional[Union[SamplingParams, PoolingParams]] = None,
+        request_id: Optional[str] = None,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
+        priority: int = 0,
+        *,
+        inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> None:
         if inputs is not None:
             prompt = inputs
-        assert (prompt is not None and params is not None
-                and request_id is not None)
+        assert prompt is not None and params is not None and request_id is not None
 
         super().__init__()
 
@@ -92,6 +94,7 @@ class RPCProcessRequest:
         self.lora_request = lora_request
         self.trace_headers = trace_headers
         self.prompt_adapter_request = prompt_adapter_request
+        self.control_vector_request = control_vector_request
         self.priority = priority
 
 
@@ -137,21 +140,26 @@ class RPCAdapterLoadedResponse:
     request_id: str
 
 
-RPC_REQUEST_T = Union[RPCProcessRequest, RPCAbortRequest, RPCStartupRequest,
-                      RPCUProfileRequest, RPCLoadAdapterRequest,
-                      RPCResetPrefixCacheRequest]
+RPC_REQUEST_T = Union[
+    RPCProcessRequest,
+    RPCAbortRequest,
+    RPCStartupRequest,
+    RPCUProfileRequest,
+    RPCLoadAdapterRequest,
+    RPCResetPrefixCacheRequest,
+]
 
-REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCAdapterLoadedResponse,
-                          RPCError]
+REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCAdapterLoadedResponse, RPCError]
 
 
-def ENGINE_DEAD_ERROR(
-        error: Optional[BaseException] = None) -> MQEngineDeadError:
+def ENGINE_DEAD_ERROR(error: Optional[BaseException] = None) -> MQEngineDeadError:
     if error is None:
         return MQEngineDeadError(
             "Engine loop is not running. Inspect the stacktrace to "
-            "find the original error")
+            "find the original error"
+        )
 
     return MQEngineDeadError(
         "Engine loop is not running. Inspect the stacktrace to "
-        f"find the original error: {repr(error)}.")
+        f"find the original error: {repr(error)}."
+    )
