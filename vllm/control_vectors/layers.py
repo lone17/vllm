@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Union
 
 import numpy as np
+from sympy import print_jscode
 import torch
 from torch import nn
 
@@ -25,7 +26,7 @@ class MLPWithControlVector(BaseLayerWithControlVector):
         self.base_layer = base_layer
         self.control_vectors: Dict[int, torch.Tensor] = {}
         self.keep_norm = False
-        self.active_index: int = None
+        self.active_index: int | None = None
 
     # def set_normalization(self, normalize: bool) -> None:
     #     self.keep_norm = normalize
@@ -63,7 +64,10 @@ class MLPWithControlVector(BaseLayerWithControlVector):
         # print(hidden_states.shape)
         hidden_states = self.base_layer(hidden_states)
         # print("  ", hidden_states.shape)
-        cv = self.control_vectors.get(self.active_index)
+        if self.active_index is not None:
+            cv = self.control_vectors.get(self.active_index)
+        else:
+            cv = None
 
         if cv is not None and cv.numel() > 0:
             norm_pre = torch.norm(hidden_states, dim=-1, keepdim=True)
@@ -81,21 +85,27 @@ class LayerNormWithSteering(nn.Module):
         self.base_layer = base_layer
 
         # u (normalized)
-        self.first_directions: dict[int, torch.Tensor] = {}
+        self.first_directions_collection: dict[int, torch.Tensor] = {}
 
         # v (normalzied)
-        self.second_directions: dict[int, torch.Tensor] = {}  # v
+        self.second_directions_collection: dict[int, torch.Tensor | None] = {}  # v
 
-        # 0: not adaptive, 1: adaptive to 1st direction, 2: adaptive to 2nd direction
-        self.adaptive_mode: dict[int, int] = {}
+        # 0: not adaptive
+        # 1: adaptive to 1st direction on span(1st dir, 2nd dir)
+        # 2: adaptive to 2nd direction on span(1st dir, 2nd dir)
+        # 3: adaptive to 1st direction on span(1st dir, hidden_states)
+        # 4: non-adaptive on span(1st dir, hidden_states)
+        self.adaptive_mode_collection: dict[int, int] = {}
+
+        self.target_degree_collection: dict[int, float] = {}
 
         # u@u^T + v@v^T
-        self.proj_matrices: dict[int, torch.Tensor] = {}
+        self.proj_matrices: dict[int, torch.Tensor | None] = {}
 
         # [u v] @ R_theta @ [1 0]^T
-        self.rotated_components: dict[int, torch.Tensor] = {}
+        self.rotated_components: dict[int, torch.Tensor | None] = {}
 
-        self.active_index: float = None
+        self.active_index: int | None = None
 
     def set_control_vector(self, index, steer_weights: SteererWeights) -> None:
         """Set a control vector at a specific index."""
@@ -105,22 +115,59 @@ class LayerNormWithSteering(nn.Module):
         second_direction = steer_weights.second_direction
         target_degree = steer_weights.target_degree
 
-        # ensure bases are orthonormal
-        u = first_direction / first_direction.norm()
-        v = second_direction - (second_direction @ u) * u
-        v /= v.norm()
+        self.first_directions_collection[index] = (
+            first_direction / first_direction.norm()
+        )
+        if second_direction is not None:
+            self.second_directions_collection[index] = (
+                second_direction / second_direction.norm()
+            )
+        else:
+            self.second_directions_collection[index] = None
+        self.adaptive_mode_collection[index] = steer_weights.adaptive_mode
+        self.target_degree_collection[index] = target_degree
 
-        self.first_directions[index] = u
-        self.second_directions[index] = second_direction / second_direction.norm()
-        self.adaptive_mode[index] = steer_weights.adaptive_mode
+        proj_matrix, rotated_component = self._get_rotation_args(
+            self.first_directions_collection[index],
+            self.second_directions_collection[index],
+            self.target_degree_collection[index],
+        )
+
+        self.proj_matrices[index] = proj_matrix
+        self.rotated_components[index] = rotated_component
+
+    def _get_rotation_args(
+        self,
+        first_directions: torch.Tensor,
+        second_directions: Optional[torch.Tensor],
+        target_degree: float,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Compute the rotated component with respect to a 2D subspace and an rotation
+        angle."""
+
+        if second_directions is None:
+            return None, None
+
+        # first_direction: (batch) x hidden_dim
+        # second_directions: (batch) x hidden_dim
+
+        # ensure bases are orthonormal
+        b1 = first_directions / first_directions.norm(dim=-1, keepdim=True)
+        b2 = (
+            second_directions
+            - torch.sum(second_directions * b1, dim=-1, keepdim=True) * b1
+        )
+        b2 /= b2.norm(dim=-1, keepdim=True)
 
         theta = np.deg2rad(target_degree)
         cos_theta = np.cos(theta)
         sin_theta = np.sin(theta)
 
-        proj_matrix = torch.outer(u, u) + torch.outer(v, v)
+        proj_matrix = torch.einsum("...i, ...j -> ...ij", b1, b1) + torch.einsum(
+            "...i, ...j -> ...ij", b2, b2
+        )
 
-        uv = torch.column_stack([u, v])
+        uv = torch.stack([b1.expand_as(b2), b2], dim=-1)  # shape (..., 2)
 
         # rotate counter-clockwise
         R_theta = torch.tensor(
@@ -133,8 +180,7 @@ class LayerNormWithSteering(nn.Module):
             uv @ R_theta @ torch.tensor([1, 0], device=uv.device, dtype=uv.dtype)
         )
 
-        self.proj_matrices[index] = proj_matrix
-        self.rotated_components[index] = rotated_component
+        return proj_matrix, rotated_component
 
     def reset_control_vector(self, index: int):
         """Reset a control vector to zero at a specific index."""
@@ -151,7 +197,7 @@ class LayerNormWithSteering(nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with optional application of control vectors."""
         if residual is None:
             hidden_states = self.base_layer(hidden_states)
@@ -161,22 +207,56 @@ class LayerNormWithSteering(nn.Module):
         if self.active_index is not None:
             device = hidden_states.device
             dtype = hidden_states.dtype
-            proj_matrix = self.proj_matrices[self.active_index].to(device, dtype=dtype)
-            rotated_component = self.rotated_components[self.active_index].to(
-                device, dtype=dtype
-            )
-            adaptive_mode = self.adaptive_mode[self.active_index]
 
-            Px = hidden_states @ proj_matrix
+            adaptive_mode = self.adaptive_mode_collection[self.active_index]
+
+            if adaptive_mode in {0, 1, 2}:
+                proj_matrix = self.proj_matrices[self.active_index].to(
+                    device, dtype=dtype
+                )
+                rotated_component = self.rotated_components[self.active_index].to(
+                    device, dtype=dtype
+                )
+            elif adaptive_mode in {3, 4}:
+                proj_matrix, rotated_component = self._get_rotation_args(
+                    self.first_directions_collection[self.active_index],
+                    hidden_states,
+                    # self.second_directions_collection[self.active_index].expand_as(
+                    #     hidden_states
+                    # ),
+                    self.target_degree_collection[self.active_index],
+                )
+                if proj_matrix is None or rotated_component is None:
+                    if residual is None:
+                        return hidden_states
+                    else:
+                        return hidden_states, residual
+
+                proj_matrix = proj_matrix.to(device, dtype=dtype)
+                rotated_component = rotated_component.to(device, dtype=dtype)
+
+            # hidden_states: batch x hidden_dim
+            # proj_matrix: (batch) x hidden_dim x hidden_dim
+            # Px: batch x hidden_dim
+            # scale: batch x 1
+            Px = torch.einsum("...i, ...ij -> ...j", hidden_states, proj_matrix)
             scale = Px.norm(dim=-1, keepdim=True)
 
-            if adaptive_mode == 0:
+            if adaptive_mode in {0, 4}:
                 hidden_states += -Px + scale * rotated_component
             else:
                 if adaptive_mode == 1:
-                    feature_direction = self.first_directions[self.active_index]
+                    feature_direction = self.first_directions_collection[
+                        self.active_index
+                    ]
                 elif adaptive_mode == 2:
-                    feature_direction = self.second_directions[self.active_index]
+                    feature_direction = self.second_directions_collection[
+                        self.active_index
+                    ]
+                elif adaptive_mode == 3:
+                    feature_direction = self.first_directions_collection[
+                        self.active_index
+                    ]
                 else:
                     raise ValueError(f"Invalid adaptive mode: {adaptive_mode}")
 
@@ -184,8 +264,36 @@ class LayerNormWithSteering(nn.Module):
                 proj_to_feature_direction = hidden_states @ feature_direction
                 mask = proj_to_feature_direction > 0
 
+                # hidden_states: batch x hidden_dim
+                # mask: batch
+                # scale: batch
+                # rotated_component: (batch) x hidden_dim
+                # Px: batch x hidden_dim
+
                 hidden_states += mask.unsqueeze(1) * (scale * rotated_component - Px)
 
         if residual is None:
             return hidden_states
         return hidden_states, residual
+
+
+if __name__ == "__main__":
+    m = LayerNormWithSteering(None)
+    b1 = torch.rand(10)
+    b2 = torch.rand(10)
+    bb2 = torch.rand(4, 10)
+
+    proj_matrix1, rotated_component1 = m._get_rotation_args(b1, b2, 60)
+    proj_matrix2, rotated_component2 = m._get_rotation_args(b1, b2.expand_as(bb2), 60)
+
+    assert proj_matrix1.shape == (10, 10)
+    assert rotated_component1.shape == (10,)
+    assert proj_matrix2.shape == (4, 10, 10)
+    assert rotated_component2.shape == (4, 10)
+    assert torch.allclose(proj_matrix1, proj_matrix2[0])
+    assert torch.allclose(rotated_component1, rotated_component2[0])
+
+    proj_matrix1, rotated_component1 = m._get_rotation_args(b1, bb2[0], 60)
+    proj_matrix2, rotated_component2 = m._get_rotation_args(b1, bb2, 60)
+    assert torch.allclose(proj_matrix1, proj_matrix2[0])
+    assert torch.allclose(rotated_component1, rotated_component2[0])
