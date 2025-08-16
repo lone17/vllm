@@ -9,10 +9,10 @@ class SteererWeights:
         self,
         first_direction: torch.Tensor,
         second_direction: Optional[torch.Tensor] = None,
-        scale_factor: Optional[float] = 1.0,
-        target_degree: Optional[float] = 0.0,
-        keep_norm: Optional[bool] = False,
-        adaptive_mode: Optional[int] = 0,
+        scale_factor: float = 1.0,
+        target_degree: float = 0.0,
+        keep_norm: bool = False,
+        adaptive_mode: int = 0,
     ):
         self.first_direction = first_direction
         self.second_direction = second_direction
