@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import sys
 from contextlib import nullcontext
 
@@ -5,6 +8,7 @@ from vllm_test_utils import BlameResult, blame
 
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.sampling_params import GuidedDecodingParams
 
 
 def run_normal():
@@ -17,7 +21,7 @@ def run_normal():
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
     # Create an LLM without guided decoding as a baseline.
-    llm = LLM(model="facebook/opt-125m",
+    llm = LLM(model="distilbert/distilgpt2",
               enforce_eager=True,
               gpu_memory_utilization=0.3)
     outputs = llm.generate(prompts, sampling_params)
@@ -31,20 +35,22 @@ def run_normal():
     cleanup_dist_env_and_memory()
 
 
-def run_lmfe(sample_regex):
+def run_xgrammar(sample_regex):
     # Create an LLM with guided decoding enabled.
-    llm = LLM(model="facebook/opt-125m",
+    llm = LLM(model="distilbert/distilgpt2",
               enforce_eager=True,
-              guided_decoding_backend="lm-format-enforcer",
+              guided_decoding_backend="xgrammar",
               gpu_memory_utilization=0.3)
-    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+    prompt = f"Give an example IPv4 address with this regex: {sample_regex}"
+    guided_decoding = GuidedDecodingParams(regex=sample_regex)
+    sampling_params = SamplingParams(temperature=0.8,
+                                     top_p=0.95,
+                                     guided_decoding=guided_decoding)
     outputs = llm.generate(
-        prompts=[
-            f"Give an example IPv4 address with this regex: {sample_regex}"
-        ] * 2,
+        prompts=[prompt] * 2,
         sampling_params=sampling_params,
         use_tqdm=True,
-        guided_options_request=dict(guided_regex=sample_regex))
+    )
 
     for output in outputs:
         prompt = output.prompt
@@ -67,7 +73,7 @@ def test_lazy_outlines(sample_regex):
         lambda: module_name in sys.modules) if use_blame else nullcontext()
     with context as result:
         run_normal()
-        run_lmfe(sample_regex)
+        run_xgrammar(sample_regex)
     if use_blame:
         assert isinstance(result, BlameResult)
         print(f"the first import location is:\n{result.trace_stack}")

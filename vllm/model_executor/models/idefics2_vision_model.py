@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # adapted from https://github.com/huggingface/transformers/blob/v4.43.2/src/transformers/models/idefics2/modeling_idefics2.py
 # Copyright 2024 The vLLM team.
 # Copyright 2024 the HuggingFace Inc. team. All rights reserved.
@@ -15,7 +18,8 @@
 # limitations under the License.
 """PyTorch Idefics2 model."""
 
-from typing import Iterable, Optional, Set, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
@@ -23,13 +27,14 @@ from transformers.models.idefics2.configuration_idefics2 import (
     Idefics2Config, Idefics2VisionConfig)
 
 from vllm.attention.layer import MultiHeadAttention
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.multimodal.utils import run_dp_sharded_vision_model
 
 
 class Idefics2VisionEmbeddings(nn.Module):
@@ -102,7 +107,7 @@ class Idefics2VisionEmbeddings(nn.Module):
                        bucket_coords_w).flatten()
             position_ids[batch_idx][p_attn_mask.view(-1).cpu()] = pos_ids
         position_ids = position_ids.to(self.position_embedding.weight.device)
-        embeddings = embeddings + self.position_embedding(position_ids)
+        embeddings += self.position_embedding(position_ids)
         return embeddings
 
 
@@ -111,9 +116,10 @@ class Idefics2VisionAttention(nn.Module):
 
     def __init__(
         self,
-        config: Idefics2Config,
+        config: Idefics2VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -126,12 +132,19 @@ class Idefics2VisionAttention(nn.Module):
                 f" {self.num_heads}).")
         self.scale = self.head_dim**-0.5
         self.dropout = config.attention_dropout
+
+        tp_size = (1 if use_data_parallel else
+                   get_tensor_model_parallel_world_size())
+        assert self.num_heads % tp_size == 0
+        self.num_heads_per_partition = self.num_heads // tp_size
+
         self.qkv_proj = QKVParallelLinear(
             self.embed_dim,
             self.head_dim,
             self.num_heads,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            disable_tp=use_data_parallel,
         )
         self.out_proj = RowParallelLinear(
             self.embed_dim,
@@ -139,9 +152,9 @@ class Idefics2VisionAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
+            disable_tp=use_data_parallel,
         )
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
+        # Use unified MultiHeadAttention with Flash Attention support
         self.attn = MultiHeadAttention(self.num_heads_per_partition,
                                        self.head_dim, self.scale)
 
@@ -153,6 +166,8 @@ class Idefics2VisionAttention(nn.Module):
             hidden_states
         )  # batch_size, q_len, 3 * num_heads_per_partition * head_dim
         query_states, key_states, value_states = qkv.chunk(3, dim=-1)
+
+        # Use unified MultiHeadAttention implementation
         out = self.attn(query_states, key_states, value_states)
         attn_output, _ = self.out_proj(out)
         return attn_output
@@ -162,9 +177,10 @@ class Idefics2VisionMLP(nn.Module):
 
     def __init__(
         self,
-        config: Idefics2Config,
+        config: Idefics2VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -175,6 +191,7 @@ class Idefics2VisionMLP(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
+            disable_tp=use_data_parallel,
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
@@ -182,6 +199,7 @@ class Idefics2VisionMLP(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
+            disable_tp=use_data_parallel,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -198,17 +216,21 @@ class Idefics2EncoderLayer(nn.Module):
         config: Idefics2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.self_attn = Idefics2VisionAttention(config,
-                                                 quant_config=quant_config,
-                                                 prefix=f"{prefix}.self_attn")
+        self.self_attn = Idefics2VisionAttention(
+            config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+            use_data_parallel=use_data_parallel)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim,
                                         eps=config.layer_norm_eps)
         self.mlp = Idefics2VisionMLP(config,
                                      quant_config=quant_config,
-                                     prefix=f"{prefix}.mlp")
+                                     prefix=f"{prefix}.mlp",
+                                     use_data_parallel=use_data_parallel)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim,
                                         eps=config.layer_norm_eps)
 
@@ -225,11 +247,11 @@ class Idefics2EncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states = self.self_attn(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states += residual
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states += residual
         return hidden_states
 
 
@@ -247,16 +269,26 @@ class Idefics2Encoder(nn.Module):
         self,
         config: Idefics2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        *,
+        num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
         self.config = config
+
+        if num_hidden_layers_override is None:
+            num_hidden_layers = config.num_hidden_layers
+        else:
+            num_hidden_layers = num_hidden_layers_override
+
         self.layers = nn.ModuleList([
             Idefics2EncoderLayer(config,
                                  quant_config=quant_config,
-                                 prefix=f"{prefix}.layers.{layer_idx}")
-            for layer_idx in range(config.num_hidden_layers)
+                                 prefix=f"{prefix}.layers.{layer_idx}",
+                                 use_data_parallel=use_data_parallel)
+            for layer_idx in range(num_hidden_layers)
         ])
 
     def forward(
@@ -285,18 +317,37 @@ class Idefics2VisionTransformer(nn.Module):
         self,
         config: Idefics2VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        *,
+        num_hidden_layers_override: Optional[int] = None,
+        require_post_norm: bool = True,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
         embed_dim = config.hidden_size
         self.config = config
+        self.use_data_parallel = use_data_parallel
         self.embeddings = Idefics2VisionEmbeddings(config)
-        self.encoder = Idefics2Encoder(config,
-                                       quant_config=quant_config,
-                                       prefix=f"{prefix}.encoder")
-        self.post_layernorm = nn.LayerNorm(embed_dim,
-                                           eps=config.layer_norm_eps)
+        self.encoder = Idefics2Encoder(
+            config,
+            quant_config=quant_config,
+            num_hidden_layers_override=num_hidden_layers_override,
+            prefix=f"{prefix}.encoder",
+            use_data_parallel=use_data_parallel)
+
+        num_hidden_layers = config.num_hidden_layers
+        if len(self.encoder.layers) > config.num_hidden_layers:
+            raise ValueError(
+                f"The original encoder only has {num_hidden_layers} "
+                f"layers, but you requested {len(self.encoder.layers)} layers."
+            )
+
+        self.require_post_norm = require_post_norm
+        self.post_layernorm = nn.LayerNorm(
+            embed_dim,
+            eps=config.layer_norm_eps,
+        ) if require_post_norm else nn.Identity()
 
     def get_input_embeddings(self):
         return self.embeddings
@@ -312,12 +363,16 @@ class Idefics2VisionTransformer(nn.Module):
             patch_attention_mask=patch_attention_mask,
             tgt_sizes=tgt_sizes,
         )
-        encoder_outputs = self.encoder(hidden_states)
+        if self.use_data_parallel:
+            encoder_outputs = run_dp_sharded_vision_model(
+                hidden_states, self.encoder)
+        else:
+            encoder_outputs = self.encoder(hidden_states)
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -325,10 +380,27 @@ class Idefics2VisionTransformer(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
+        layer_count = len(self.encoder.layers)
+
         for name, loaded_weight in weights:
+            # skip pooling header
+            if name.startswith("head."):
+                continue
+
+            # post_layernorm is optional
+            if (name.startswith("post_layernorm.")
+                    and not self.require_post_norm):
+                continue
+
+            # omit layers when num_hidden_layers_override is set
+            if name.startswith("encoder.layers."):
+                layer_idx = int(name.split(".")[2])
+                if layer_idx >= layer_count:
+                    continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in name or self.use_data_parallel:
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]

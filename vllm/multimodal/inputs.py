@@ -1,57 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from abc import ABC, abstractmethod
 from collections import UserDict, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Any, Literal, Optional, TypedDict, TypeVar,
-                    Union, cast, final)
+from functools import partial
+from itertools import accumulate
+from typing import (TYPE_CHECKING, Any, Literal, Optional, TypedDict, Union,
+                    cast, final)
 
 import numpy as np
-import torch
-import torch.types
-from PIL.Image import Image
-from transformers import BatchFeature
-from typing_extensions import NotRequired, TypeAlias
+from typing_extensions import NotRequired, TypeAlias, TypeVar, deprecated
 
-from vllm.utils import JSONTree, full_groupby, is_list_of, json_map_leaves
+from vllm.utils import LazyLoader, full_groupby, is_list_of
+from vllm.utils.jsontree import JSONTree, json_map_leaves
 
 if TYPE_CHECKING:
-    from .hasher import MultiModalHashDict
+    import torch
+    import torch.types
+    from PIL.Image import Image
+    from transformers.feature_extraction_utils import BatchFeature
+
+    from .processing import MultiModalHashes
+
+else:
+    torch = LazyLoader("torch", globals(), "torch")
 
 _T = TypeVar("_T")
 
-HfImageItem: TypeAlias = Union[Image, np.ndarray, torch.Tensor]
+HfImageItem: TypeAlias = Union["Image", np.ndarray, "torch.Tensor"]
 """
-A :class:`transformers.image_utils.ImageInput` representing a single image
-item, which can be passed to a HuggingFace :code:`ImageProcessor`.
-"""
-
-HfVideoItem: TypeAlias = Union[list[Image], np.ndarray, torch.Tensor,
-                               list[np.ndarray], list[torch.Tensor]]
-"""
-A :class:`transformers.image_utils.VideoInput` representing a single video
-item, which can be passed to a HuggingFace :code:`VideoProcessor`.
+A `transformers.image_utils.ImageInput` representing a single image
+item, which can be passed to a HuggingFace `ImageProcessor`.
 """
 
-HfAudioItem: TypeAlias = Union[list[float], np.ndarray, torch.Tensor]
+HfVideoItem: TypeAlias = Union[list["Image"], np.ndarray, "torch.Tensor",
+                               list[np.ndarray], list["torch.Tensor"]]
+"""
+A `transformers.image_utils.VideoInput` representing a single video
+item, which can be passed to a HuggingFace `VideoProcessor`.
+"""
+
+HfAudioItem: TypeAlias = Union[list[float], np.ndarray, "torch.Tensor"]
 """
 Represents a single audio
-item, which can be passed to a HuggingFace :code:`AudioProcessor`.
+item, which can be passed to a HuggingFace `AudioProcessor`.
 """
 
-ImageItem: TypeAlias = Union[HfImageItem, torch.Tensor]
+ImageItem: TypeAlias = Union[HfImageItem, "torch.Tensor"]
 """
-A :class:`transformers.image_utils.ImageInput` representing a single image
-item, which can be passed to a HuggingFace :code:`ImageProcessor`.
+A `transformers.image_utils.ImageInput` representing a single image
+item, which can be passed to a HuggingFace `ImageProcessor`.
 
 Alternatively, a 3-D tensor or batch of 2-D tensors,
 which are treated as image embeddings;
 these are directly passed to the model without HF processing.
 """
 
-VideoItem: TypeAlias = Union[HfVideoItem, torch.Tensor]
+VideoItem: TypeAlias = Union[HfVideoItem, "torch.Tensor",
+                             tuple[HfVideoItem, dict[str, Any]]]
 """
-A :class:`transformers.image_utils.VideoInput` representing a single video
-item, which can be passed to a HuggingFace :code:`VideoProcessor`.
+A `transformers.video_utils.VideoInput` representing a single video item. 
+This can be passed to a HuggingFace `VideoProcessor` 
+with `transformers.video_utils.VideoMetadata`.
 
 Alternatively, a 3-D tensor or batch of 2-D tensors,
 which are treated as video embeddings;
@@ -59,10 +71,10 @@ these are directly passed to the model without HF processing.
 """
 
 AudioItem: TypeAlias = Union[HfAudioItem, tuple[np.ndarray, float],
-                             torch.Tensor]
+                             "torch.Tensor"]
 """
 Represents a single audio
-item, which can be passed to a HuggingFace :code:`AudioProcessor`.
+item, which can be passed to a HuggingFace `AudioProcessor`.
 
 Alternatively, a tuple `(audio, sampling_rate)`, where the sampling rate
 is different from that expected by the model;
@@ -73,12 +85,13 @@ which are treated as audio embeddings;
 these are directly passed to the model without HF processing.
 """
 
-ModalityData: TypeAlias = Union[_T, list[_T]]
+ModalityData: TypeAlias = Union[_T, list[Optional[_T]], None]
 """
-Either a single data item, or a list of data items.
+Either a single data item, or a list of data items. Can only be None if UUID
+is provided.
 
 The number of data items allowed per modality is restricted by
-:code:`--limit-mm-per-prompt`.
+`--limit-mm-per-prompt`.
 """
 
 
@@ -100,24 +113,36 @@ MultiModalDataDict: TypeAlias = Mapping[str, ModalityData[Any]]
 """
 A dictionary containing an entry for each modality type to input.
 
-The built-in modalities are defined by :class:`MultiModalDataBuiltins`.
+The built-in modalities are defined by
+[`MultiModalDataBuiltins`][vllm.multimodal.inputs.MultiModalDataBuiltins].
+"""
+
+MultiModalUUIDDict: TypeAlias = Mapping[str, Union[list[Optional[str]], str]]
+"""
+A dictionary containing user-provided UUIDs for items in each modality.
+If a UUID for an item is not provided, its entry will be `None` and
+MultiModalHasher will compute a hash for the item.
+
+The UUID will be used to identify the item for all caching purposes
+(input processing caching, embedding caching, prefix caching, etc).
 """
 
 
-class PlaceholderRange(TypedDict):
+@dataclass(frozen=True)
+class PlaceholderRange:
     """
     Placeholder location information for multi-modal data.
 
     Example:
 
-        Prompt: :code:`AAAA BBBB What is in these images?`
+    Prompt: `AAAA BBBB What is in these images?`
 
-        Images A and B will have:
+    Images A and B will have:
 
-        .. code-block::
-
-            A: { "offset": 0, "length": 4 }
-            B: { "offset": 5, "length": 4 }
+    ```
+    A: PlaceholderRange(offset=0, length=4)
+    B: PlaceholderRange(offset=5, length=4)
+    ```
     """
 
     offset: int
@@ -126,20 +151,46 @@ class PlaceholderRange(TypedDict):
     length: int
     """The length of the placeholder."""
 
+    is_embed: Optional["torch.Tensor"] = None
+    """
+    A boolean mask of shape `(length,)` indicating which positions
+    between `offset` and `offset + length` to assign embeddings to.
+    """
 
-NestedTensors = Union[list["NestedTensors"], list[torch.Tensor], torch.Tensor,
-                      tuple[torch.Tensor, ...]]
+    def get_num_embeds(self) -> int:
+        if self.is_embed is None:
+            return self.length
+
+        return int(self.is_embed.sum().item())
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, self.__class__):
+            return False
+        if not (self.offset, self.length) == (other.offset, other.length):
+            return False
+
+        if self.is_embed is None:
+            return other.is_embed is None
+        if other.is_embed is None:
+            return self.is_embed is None
+
+        return nested_tensors_equal(self.is_embed, other.is_embed)
+
+
+NestedTensors: TypeAlias = Union[list["NestedTensors"], list["torch.Tensor"],
+                                 "torch.Tensor", tuple["torch.Tensor", ...]]
 """
 Uses a list instead of a tensor if the dimensions of each element do not match.
 """
 
 
 def nested_tensors_equal(a: NestedTensors, b: NestedTensors) -> bool:
-    """Equality check between :data:`NestedTensors` objects."""
+    """Equality check between
+    [`NestedTensors`][vllm.multimodal.inputs.NestedTensors] objects."""
     if isinstance(a, torch.Tensor):
-        return isinstance(b, torch.Tensor) and bool((a == b).all().item())
+        return isinstance(b, torch.Tensor) and torch.equal(a, b)
     elif isinstance(b, torch.Tensor):
-        return isinstance(a, torch.Tensor) and bool((b == a).all().item())
+        return isinstance(a, torch.Tensor) and torch.equal(b, a)
 
     if isinstance(a, list):
         return (isinstance(b, list)
@@ -155,63 +206,189 @@ def nested_tensors_equal(a: NestedTensors, b: NestedTensors) -> bool:
 BatchedTensorInputs: TypeAlias = Mapping[str, NestedTensors]
 """
 A dictionary containing nested tensors which have been batched via
-:meth:`MultiModalKwargs.batch`.
+[`MultiModalKwargs.batch`][vllm.multimodal.inputs.MultiModalKwargs.batch].
 """
 
 
-@dataclass(frozen=True)
+@dataclass
+class MultiModalFeatureSpec:
+    """
+    Represents a single multimodal input with its processed data and metadata.
+    
+    Used by the V1 engine to track multimodal data through processing and
+    caching. A request containing multiple multimodal items will have one
+    MultiModalFeatureSpec per item.
+    """
+
+    data: Optional["MultiModalKwargsItem"]
+    """Multimodal data for this feature"""
+
+    modality: str
+    """Based on the input, e.g., "image", "audio", "video"."""
+
+    identifier: str
+    """mm_hash or uuid for caching encoder outputs."""
+
+    mm_position: PlaceholderRange
+    """e.g., PlaceholderRange(offset=2, length=336)"""
+
+
+@dataclass
 class MultiModalFieldElem:
-    """Contains metadata and data of an item in :class:`MultiModalKwargs`."""
-    field: "BaseMultiModalField"
+    """
+    Represents a keyword argument corresponding to a multi-modal item
+    in [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs].
+    """
+
+    modality: str
+    """
+    The modality of the corresponding multi-modal item.
+    Each multi-modal item can consist of multiple keyword arguments.
+    """
+
+    key: str
+    """
+    The key of this field in
+    [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs],
+    i.e. the name of the keyword argument to be passed to the model.
+    """
+
     data: NestedTensors
+    """
+    The tensor data of this field in
+    [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs],
+    i.e. the value of the keyword argument to be passed to the model.
+
+    It may be set to `None` if it is determined that the item is cached
+    in `EngineCore`.
+    """
+
+    field: "BaseMultiModalField"
+    """
+    Defines how to combine the tensor data of this field with others
+    in order to batch multi-modal items together for model inference.
+    """
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return False
 
-        return (self.field == other.field
-                and nested_tensors_equal(self.data, other.data))
+        if self.data is None:
+            data_equal = other.data is None
+        elif other.data is None:
+            data_equal = self.data is None
+        else:
+            data_equal = nested_tensors_equal(self.data, other.data)
+
+        return ((self.modality, self.key) == (other.modality, other.key)
+                and data_equal
+                and type(self.field) == type(other.field))  # noqa: E721
 
 
 @dataclass(frozen=True)
 class BaseMultiModalField(ABC):
-    """Abstract base class for a field in :class:`MultiModalKwargs`."""
-    key: str
-    modality: str
+    """
+    Defines how to interpret tensor data belonging to a keyword argument in
+    [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs] for multiple
+    multi-modal items, and vice versa.
+    """
+
+    def _field_factory(self, *, modality: str, key: str):
+        f = partial(
+            MultiModalFieldElem,
+            modality=modality,
+            key=key,
+            field=self,
+        )
+
+        # Allow passing data as positional argument
+        def factory(data: NestedTensors) -> MultiModalFieldElem:
+            return f(data=data)
+
+        return factory
 
     @abstractmethod
-    def _reduce_data(self, batch: list[NestedTensors]) -> NestedTensors:
+    def build_elems(
+        self,
+        modality: str,
+        key: str,
+        data: NestedTensors,
+    ) -> Sequence[MultiModalFieldElem]:
+        """
+        Construct
+        [`MultiModalFieldElem`][vllm.multimodal.inputs.MultiModalFieldElem]
+        instances to represent the provided data.
+
+        This is the inverse of
+        [`reduce_data`][vllm.multimodal.inputs.BaseMultiModalField.reduce_data].
+        """
         raise NotImplementedError
 
-    def _build_elem(self, data: NestedTensors) -> MultiModalFieldElem:
-        return MultiModalFieldElem(self, data)
+    @abstractmethod
+    def _reduce_data(
+        self,
+        batch: list[NestedTensors],
+        *,
+        pin_memory: bool,
+    ) -> NestedTensors:
+        raise NotImplementedError
 
-    def reduce(self, batch: list[MultiModalFieldElem]) -> MultiModalFieldElem:
-        """Merge multiple instances of :class:`MultiModalFieldElem` together."""
-        fields = [item.field for item in batch]
-        if len(set(fields)) > 1:
-            raise ValueError(f"Cannot merge different {fields=}")
+    def reduce_data(
+        self,
+        elems: list[MultiModalFieldElem],
+        *,
+        pin_memory: bool = False,
+    ) -> NestedTensors:
+        """
+        Merge the data from multiple instances of
+        [`MultiModalFieldElem`][vllm.multimodal.inputs.MultiModalFieldElem].
 
-        data = self._reduce_data([item.data for item in batch])
+        This is the inverse of
+        [`build_elems`][vllm.multimodal.inputs.BaseMultiModalField.build_elems].
+        """
+        field_types = [type(item.field) for item in elems]
+        if len(set(field_types)) > 1:
+            raise ValueError(f"Cannot merge different {field_types=}")
 
-        return self._build_elem(data)
+        batch = [elem.data for elem in elems]
+        return self._reduce_data(batch, pin_memory=pin_memory)
 
 
 @dataclass(frozen=True)
 class MultiModalBatchedField(BaseMultiModalField):
     """
-    A :class:`BaseMultiModalField` implementation where an element in the batch
-    is obtained by indexing into the first dimension of the underlying data.
+    Info:
+        [`MultiModalFieldConfig.batched`][vllm.multimodal.inputs.MultiModalFieldConfig.batched]
     """
 
-    def build_elems(self, batch: NestedTensors) -> list[MultiModalFieldElem]:
-        return [self._build_elem(item) for item in batch]
+    def build_elems(
+        self,
+        modality: str,
+        key: str,
+        data: NestedTensors,
+    ) -> Sequence[MultiModalFieldElem]:
+        field_factory = self._field_factory(modality=modality, key=key)
+        return [field_factory(item) for item in data]
 
-    def _reduce_data(self, batch: list[NestedTensors]) -> NestedTensors:
+    def _reduce_data(
+        self,
+        batch: list[NestedTensors],
+        *,
+        pin_memory: bool,
+    ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
+            if len(batch) == 1:
+                # An optimization when `batch` contains only one tensor:
+                # - produce exactly same result as `torch.stack(batch)`
+                # - will achieve zero-copy if the tensor is contiguous
+                return batch[0].unsqueeze(0).contiguous()
             first_shape = batch[0].shape
             if all(elem.shape == first_shape for elem in batch):
-                return torch.stack(batch)
+                out = torch.empty((len(batch), *batch[0].shape),
+                                  dtype=batch[0].dtype,
+                                  device=batch[0].device,
+                                  pin_memory=pin_memory)
+                return torch.stack(batch, out=out)
 
         return batch
 
@@ -219,96 +396,331 @@ class MultiModalBatchedField(BaseMultiModalField):
 @dataclass(frozen=True)
 class MultiModalFlatField(BaseMultiModalField):
     """
-    A :class:`BaseMultiModalField` implementation where an element in the batch
-    is obtained by slicing along the first dimension of the underlying data.
+    Info:
+        [`MultiModalFieldConfig.flat`][vllm.multimodal.inputs.MultiModalFieldConfig.flat]
+        [`MultiModalFieldConfig.flat_from_sizes`][vllm.multimodal.inputs.MultiModalFieldConfig.flat_from_sizes]
     """
+    slices: Union[Sequence[slice], Sequence[Sequence[slice]]]
+    dim: int = 0
 
     def build_elems(
         self,
-        batch: NestedTensors,
-        slices: Sequence[slice],
-    ) -> list[MultiModalFieldElem]:
-        return [self._build_elem(batch[slice_]) for slice_ in slices]
+        modality: str,
+        key: str,
+        data: NestedTensors,
+    ) -> Sequence[MultiModalFieldElem]:
+        field_factory = self._field_factory(modality=modality, key=key)
+        if not is_list_of(self.slices, slice, check="all"):
+            assert isinstance(data, torch.Tensor), \
+                "torch.Tensor is required for multiple slices"
+        return [field_factory(data[cast(slice, s)]) for s in self.slices]
 
-    def _reduce_data(self, batch: list[NestedTensors]) -> NestedTensors:
+    def _reduce_data(
+        self,
+        batch: list[NestedTensors],
+        *,
+        pin_memory: bool,
+    ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
-            first_shape = batch[0].shape
-            if all(elem.shape[1:] == first_shape[1:] for elem in batch):
-                return torch.concat(batch)
+            if len(batch) == 1:
+                # An optimization when `batch` contains only one tensor:
+                # - produce exactly same result as `torch.concat(batch)`
+                # - will achieve zero-copy if the tensor is contiguous
+                return batch[0].contiguous()
 
+            dim = self.dim + (self.dim < 0) * len(batch[0].shape)
+
+            def _shape_before_after(tensor: torch.Tensor):
+                return tensor.shape[:dim], tensor.shape[dim + 1:]
+
+            first_shape = _shape_before_after(batch[0])
+
+            if all(_shape_before_after(elem) == first_shape for elem in batch):
+                shape_before, shape_after = first_shape
+                shape_concat = sum(item.shape[dim] for item in batch)
+                out = torch.empty((*shape_before, shape_concat, *shape_after),
+                                  dtype=batch[0].dtype,
+                                  device=batch[0].device,
+                                  pin_memory=pin_memory)
+                return torch.concat(batch, dim=self.dim, out=out)
+
+        assert self.dim == 0, "dim == 0 is required for nested list"
         return [e for elem in batch for e in elem]
+
+
+@dataclass(frozen=True)
+class MultiModalSharedField(BaseMultiModalField):
+    """
+    Info:
+        [`MultiModalFieldConfig.shared`][vllm.multimodal.inputs.MultiModalFieldConfig.shared]
+    """
+    batch_size: int
+
+    def build_elems(
+        self,
+        modality: str,
+        key: str,
+        data: NestedTensors,
+    ) -> Sequence[MultiModalFieldElem]:
+        field_factory = self._field_factory(modality=modality, key=key)
+        return [field_factory(data)] * self.batch_size
+
+    def _reduce_data(
+        self,
+        batch: list[NestedTensors],
+        *,
+        pin_memory: bool,
+    ) -> NestedTensors:
+        return batch[0]
 
 
 class MultiModalFieldConfig:
 
     @staticmethod
     def batched(modality: str):
+        """
+        Defines a field where an element in the batch is obtained by
+        indexing into the first dimension of the underlying data.
+
+        Args:
+            modality: The modality of the multi-modal item that uses this
+                keyword argument.
+
+        Example:
+
+        ```
+        Input:
+            Data: [[AAAA]
+                [BBBB]
+                [CCCC]]
+
+        Output:
+            Element 1: [AAAA]
+            Element 2: [BBBB]
+            Element 3: [CCCC]
+        ```
+        """
         return MultiModalFieldConfig(
-            field_cls=MultiModalBatchedField,
+            field=MultiModalBatchedField(),
             modality=modality,
         )
 
     @staticmethod
-    def flat(modality: str, slices: Sequence[slice]):
+    def flat(modality: str,
+             slices: Union[Sequence[slice], Sequence[Sequence[slice]]],
+             dim: int = 0):
+        """
+        Defines a field where an element in the batch is obtained by
+        slicing along the first dimension of the underlying data.
+
+        Args:
+            modality: The modality of the multi-modal item that uses this
+                keyword argument.
+            slices: For each multi-modal item, a slice (dim=0) or a tuple of
+                slices (dim>0) that is used to extract the data corresponding
+                to it.
+            dim: The dimension to extract data, default to 0.
+
+        Example:
+
+        ```
+        Given:
+            slices: [slice(0, 3), slice(3, 7), slice(7, 9)]
+
+        Input:
+            Data: [AAABBBBCC]
+
+        Output:
+            Element 1: [AAA]
+            Element 2: [BBBB]
+            Element 3: [CC]
+        ```
+
+        ```
+        Given:
+            slices: [
+                (slice(None), slice(0, 3)),
+                (slice(None), slice(3, 7)),
+                (slice(None), slice(7, 9))]
+            dim: 1
+
+        Input:
+            Data: [[A],[A],[A],[B],[B],[B],[B],[C],[C]]
+
+        Output:
+            Element 1: [[A],[A],[A]]
+            Element 2: [[B],[B],[B],[B]]
+            Element 3: [[C],[C]]
+        ```
+        """
         return MultiModalFieldConfig(
-            field_cls=MultiModalFlatField,
+            field=MultiModalFlatField(slices=slices, dim=dim),
             modality=modality,
-            slices=slices,
         )
 
-    def __init__(
-        self,
-        field_cls: type[BaseMultiModalField],
-        modality: str,
-        **field_config: Any,
-    ) -> None:
+    @staticmethod
+    def flat_from_sizes(modality: str,
+                        size_per_item: "torch.Tensor",
+                        dim: int = 0):
+        """
+        Defines a field where an element in the batch is obtained by
+        slicing along the first dimension of the underlying data.
+
+        Args:
+            modality: The modality of the multi-modal item that uses this
+                keyword argument.
+            slices: For each multi-modal item, the size of the slice that
+                is used to extract the data corresponding to it.
+            dim: The dimension to slice, default to 0.
+
+        Example:
+
+        ```
+        Given:
+            size_per_item: [3, 4, 2]
+
+        Input:
+            Data: [AAABBBBCC]
+
+        Output:
+            Element 1: [AAA]
+            Element 2: [BBBB]
+            Element 3: [CC]
+        ```
+
+        ```
+        Given:
+            slices: [3, 4, 2]
+            dim: 1
+
+        Input:
+            Data: [[A],[A],[A],[B],[B],[B],[B],[C],[C]]
+
+        Output:
+            Element 1: [[A],[A],[A]]
+            Element 2: [[B],[B],[B],[B]]
+            Element 3: [[C],[C]]
+        ```
+
+        Info:
+            [`MultiModalFieldConfig.flat`][vllm.multimodal.inputs.MultiModalFieldConfig.flat]
+        """
+
+        if size_per_item.ndim != 1:
+            raise ValueError("size_per_item should be a 1-D tensor, "
+                             f"but found shape: {size_per_item.shape}")
+
+        slice_idxs = [0, *accumulate(size_per_item)]
+        slices = [(slice(None, None, None), ) * dim +
+                  (slice(slice_idxs[i], slice_idxs[i + 1]), )
+                  for i in range(len(size_per_item))]
+
+        return MultiModalFieldConfig.flat(modality, slices, dim=dim)
+
+    @staticmethod
+    def shared(modality: str, batch_size: int):
+        """
+        Defines a field where an element in the batch is obtained by
+        taking the entirety of the underlying data.
+
+        This means that the data is the same for each element in the batch.
+
+        Args:
+            modality: The modality of the multi-modal item that uses this
+                keyword argument.
+            batch_size: The number of multi-modal items which share this data.
+
+        Example:
+
+        ```
+        Given:
+            batch_size: 4
+
+        Input:
+            Data: [XYZ]
+
+        Output:
+            Element 1: [XYZ]
+            Element 2: [XYZ]
+            Element 3: [XYZ]
+            Element 4: [XYZ]
+        ```
+        """
+        return MultiModalFieldConfig(
+            field=MultiModalSharedField(batch_size),
+            modality=modality,
+        )
+
+    def __init__(self, field: BaseMultiModalField, modality: str) -> None:
         super().__init__()
 
-        self.field_cls = field_cls
+        self.field = field
         self.modality = modality
-        self.field_config = field_config
 
     def build_elems(
         self,
         key: str,
         batch: NestedTensors,
     ) -> Sequence[MultiModalFieldElem]:
-        field = self.field_cls(key=key, modality=self.modality)
-        return field.build_elems(batch, **self.field_config)  # type: ignore
+        return self.field.build_elems(self.modality, key, batch)
 
 
 class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
     """
-    A collection of :class:`MultiModalFieldElem`
-    corresponding to a data item in :class:`MultiModalDataItems`.
+    A collection of
+    [`MultiModalFieldElem`][vllm.multimodal.inputs.MultiModalFieldElem]
+    corresponding to a data item in
+    [`MultiModalDataItems`][vllm.multimodal.parse.MultiModalDataItems].
     """
 
     @staticmethod
+    def dummy(modality: str):
+        """Convenience class for testing."""
+        mm_elem = MultiModalFieldElem(
+            modality=modality,
+            key="dummy",
+            data=torch.empty(1),
+            field=MultiModalSharedField(1),
+        )
+        return MultiModalKwargsItem.from_elems([mm_elem])
+
+    @staticmethod
     def from_elems(elems: Sequence[MultiModalFieldElem]):
-        return MultiModalKwargsItem({elem.field.key: elem for elem in elems})
+        return MultiModalKwargsItem({elem.key: elem for elem in elems})
+
+    def __init__(self, data: Mapping[str, MultiModalFieldElem] = {}) -> None:
+        super().__init__(data)
+
+        modalities = {elem.modality for elem in self.values()}
+        assert len(modalities) == 1, f"Found different modalities={modalities}"
+        self._modality = next(iter(modalities))
 
     @property
     def modality(self) -> str:
-        modalities = {elem.field.modality for elem in self.data.values()}
-        assert len(modalities) == 1, f"Found different modalities={modalities}"
-        return next(iter(modalities))
+        return self._modality
+
+    def get_data(self) -> dict[str, NestedTensors]:
+        return {key: elem.data for key, elem in self.items()}
 
 
-# NOTE: UserDict is for V0 compatibility.
-# V1 should access individual items via `get_item`.
-class MultiModalKwargs(UserDict[str, NestedTensors]):
+_I = TypeVar(
+    "_I",
+    MultiModalKwargsItem,
+    Optional[MultiModalKwargsItem],
+    default=MultiModalKwargsItem,
+)
+
+
+class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
     """
-    A dictionary that represents the keyword arguments to
-    :meth:`~torch.nn.Module.forward`.
-
-    The metadata :code:`items` enables us to obtain the keyword arguments
-    corresponding to each data item in :class:`MultiModalDataItems`, via
-    :meth:`get_item` and :meth:`get_items`.
+    A dictionary of
+    [`MultiModalKwargsItem`][vllm.multimodal.inputs.MultiModalKwargsItem]s
+    by modality.
     """
 
     @staticmethod
     def from_hf_inputs(
-        hf_inputs: BatchFeature,
+        hf_inputs: "BatchFeature",
         config_by_key: Mapping[str, MultiModalFieldConfig],
     ):
         # NOTE: This skips fields in `hf_inputs` that are not in `config_by_key`
@@ -338,40 +750,78 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
                 elems = [v[item_idx] for v in elems_in_modality.values()]
                 items.append(MultiModalKwargsItem.from_elems(elems))
 
-        return MultiModalKwargs.from_items(items)
+        return MultiModalKwargsItems.from_seq(items)
 
     @staticmethod
-    def from_items(items: Sequence[MultiModalKwargsItem]):
-        """Construct a new :class:`MultiModalKwargs` from multiple items."""
+    def from_seq(items: Sequence[MultiModalKwargsItem]):
+        items_by_modality = full_groupby(items, key=lambda x: x.modality)
+        return MultiModalKwargsItems(items_by_modality)
+
+    def __getitem__(self, modality: str) -> Sequence[_I]:
+        if modality not in self:
+            raise KeyError(f"Modality {modality!r} not found. "
+                           f"Available modalities: {set(self.keys())}")
+
+        return super().__getitem__(modality)  # type: ignore[return-value]
+
+    def get_data(self, *, pin_memory: bool = False) -> "MultiModalKwargs":
         elems_by_key = defaultdict[str, list[MultiModalFieldElem]](list)
-        for item in items:
-            for key, elem in item.items():
-                elems_by_key[key].append(elem)
+        for modality, items in self.items():
+            for i, item in enumerate(items):
+                if item is None:
+                    raise RuntimeError("Cannot build data from empty "
+                                       f"mm_items[{modality}][{i}]")
 
-        data = {
-            key: elems[0].field.reduce(elems).data
-            for key, elems in elems_by_key.items() if len(elems) > 0
-        }
+                for key, elem in item.items():
+                    elems_by_key[key].append(elem)
 
-        return MultiModalKwargs(data, items=items)
+        return MultiModalKwargs({
+            key:
+            elems[0].field.reduce_data(elems, pin_memory=pin_memory)
+            for key, elems in elems_by_key.items()
+        })
 
-    def __init__(
-        self,
-        data: Mapping[str, NestedTensors],
-        *,
-        items: Optional[Sequence[MultiModalKwargsItem]] = None,
-    ) -> None:
-        super().__init__(data)
 
-        items_by_modality = full_groupby(items or [], key=lambda x: x.modality)
-        self._items_by_modality = dict(items_by_modality)
+MultiModalKwargsOptionalItems: TypeAlias = Union[
+    MultiModalKwargsItems[MultiModalKwargsItem],
+    MultiModalKwargsItems[Optional[MultiModalKwargsItem]],
+]
 
-    @property
-    def modalities(self):
-        return self._items_by_modality.keys()
+
+class MultiModalKwargs(UserDict[str, NestedTensors]):
+    """
+    A dictionary that represents the keyword arguments to
+    [`torch.nn.Module.forward`][].
+    """
 
     @staticmethod
-    def _try_stack(nested_tensors: NestedTensors) -> NestedTensors:
+    @deprecated("`MultiModalKwargs.from_hf_inputs` is deprecated and "
+                "will be removed in v0.13. "
+                "Please use `MultiModalKwargsItems.from_hf_inputs` and "
+                "access the tensor data using `.get_data()`.")
+    def from_hf_inputs(
+        hf_inputs: "BatchFeature",
+        config_by_key: Mapping[str, MultiModalFieldConfig],
+    ):
+        return MultiModalKwargsItems.from_hf_inputs(hf_inputs, config_by_key) \
+            .get_data()
+
+    @staticmethod
+    @deprecated("`MultiModalKwargs.from_items` is deprecated and "
+                "will be removed in v0.13. "
+                "Please use `MultiModalKwargsItems.from_seq` and "
+                "access the tensor data using `.get_data()`.")
+    def from_items(
+        items: Sequence[MultiModalKwargsItem],
+        *,
+        pin_memory: bool = False,
+    ):
+        return MultiModalKwargsItems.from_seq(items) \
+            .get_data(pin_memory=pin_memory)
+
+    @staticmethod
+    def _try_stack(nested_tensors: NestedTensors,
+                   pin_memory: bool = False) -> NestedTensors:
         """
         Stack the inner dimensions that have the same shape in
         a nested list of tensors.
@@ -388,20 +838,34 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
         if isinstance(nested_tensors, (int, float)):
             return torch.tensor(nested_tensors)
 
-        stacked = [MultiModalKwargs._try_stack(t) for t in nested_tensors]
+        stacked = [
+            MultiModalKwargs._try_stack(t, pin_memory) for t in nested_tensors
+        ]
         if not is_list_of(stacked, torch.Tensor, check="all"):
             # Only tensors (not lists) can be stacked.
             return stacked
 
         tensors_ = cast(list[torch.Tensor], stacked)
+        if len(tensors_) == 1:
+            # An optimization when `tensors_` contains only one tensor:
+            # - produce exactly same result as `torch.stack(tensors_)`
+            # - will achieve zero-copy if the tensor is contiguous
+            return tensors_[0].unsqueeze(0).contiguous()
+
         if any(t.shape != tensors_[0].shape for t in tensors_):
             # The tensors have incompatible shapes and can't be stacked.
             return tensors_
 
-        return torch.stack(tensors_)
+        outputs = torch.empty(len(tensors_),
+                              *tensors_[0].shape,
+                              dtype=tensors_[0].dtype,
+                              device=tensors_[0].device,
+                              pin_memory=pin_memory)
+        return torch.stack(tensors_, out=outputs)
 
     @staticmethod
-    def batch(inputs_list: list["MultiModalKwargs"]) -> BatchedTensorInputs:
+    def batch(inputs_list: list["MultiModalKwargs"],
+              pin_memory: bool = False) -> BatchedTensorInputs:
         """
         Batch multiple inputs together into a dictionary.
 
@@ -423,7 +887,7 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
                 item_lists[k].append(v)
 
         return {
-            k: MultiModalKwargs._try_stack(item_list)
+            k: MultiModalKwargs._try_stack(item_list, pin_memory)
             for k, item_list in item_lists.items()
         }
 
@@ -436,56 +900,33 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
         json_inputs = cast(JSONTree[torch.Tensor], batched_inputs)
 
         json_mapped = json_map_leaves(
-            lambda x: x.to(device, non_blocking=True),
+            lambda x: x.to(device=device, non_blocking=True),
             json_inputs,
         )
 
         return cast(BatchedTensorInputs, json_mapped)
 
+    def __getitem__(self, key: str):
+        if key not in self:
+            raise KeyError(f"Keyword argument {key!r} not found. "
+                           f"Available keys: {set(self.keys())}")
+
+        return super().__getitem__(key)
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return False
-        if self._items_by_modality != other._items_by_modality:
-            return False
 
-        ks = self.keys()
-        return (ks == other.keys()
-                and all(nested_tensors_equal(self[k], other[k]) for k in ks))
+        for k in self:
+            if k not in other:
+                return False
+            if not nested_tensors_equal(self[k], other[k]):
+                return False
 
-    def _validate_modality(self, method_name: str, modality: str) -> None:
-        if not self._items_by_modality:
-            raise RuntimeError(
-                f"`{method_name}` is not supported when "
-                "MultiModalKwargs is not initialized with `items`")
-
-        if modality not in self._items_by_modality:
-            available_modalities = set(self._items_by_modality.keys())
-            raise KeyError(f"Modality {modality!r} not found. "
-                           f"Available modalities: {available_modalities}")
-
-    def get_item_count(self, modality: str) -> int:
-        """Get the number of items belonging to a modality."""
-        self._validate_modality("get_item_count", modality)
-        return len(self._items_by_modality[modality])
-
-    def get_item(self, modality: str, item_index: int) -> MultiModalKwargsItem:
-        """
-        Get the keyword arguments corresponding to an item identified by
-        its modality and index.
-        """
-        self._validate_modality("get_item", modality)
-        return self._items_by_modality[modality][item_index]
-
-    def get_items(self, modality: str) -> Sequence[MultiModalKwargsItem]:
-        """
-        Get the keyword arguments corresponding to each item belonging to
-        a modality.
-        """
-        self._validate_modality("get_items", modality)
-        return self._items_by_modality[modality]
+        return True
 
 
-MultiModalPlaceholderDict = Mapping[str, Sequence[PlaceholderRange]]
+MultiModalPlaceholderDict: TypeAlias = Mapping[str, Sequence[PlaceholderRange]]
 """
 A dictionary containing placeholder ranges for each modality.
 """
@@ -494,7 +935,7 @@ A dictionary containing placeholder ranges for each modality.
 class MultiModalInputs(TypedDict):
     """
     Represents the outputs of
-    :class:`vllm.multimodal.processing.BaseMultiModalProcessor`,
+    [`BaseMultiModalProcessor`][vllm.multimodal.processing.BaseMultiModalProcessor],
     ready to be passed to vLLM internals.
     """
 
@@ -507,17 +948,33 @@ class MultiModalInputs(TypedDict):
     prompt_token_ids: list[int]
     """The processed token IDs which includes placeholder tokens."""
 
-    token_type_ids: NotRequired[list[int]]
-    """The token type IDs of the prompt."""
-
-    mm_kwargs: MultiModalKwargs
+    mm_kwargs: MultiModalKwargsOptionalItems
     """Keyword arguments to be directly passed to the model after batching."""
 
-    mm_hashes: NotRequired[Optional["MultiModalHashDict"]]
+    mm_hashes: "MultiModalHashes"
     """The hashes of the multi-modal data."""
 
-    mm_placeholders: MultiModalPlaceholderDict
+    mm_placeholders: "MultiModalPlaceholderDict"
     """
     For each modality, information about the placeholder tokens in
-    :code:`prompt_token_ids`.
+    `prompt_token_ids`.
     """
+
+    cache_salt: NotRequired[str]
+    """
+    Optional cache salt to be used for prefix caching.
+    """
+
+
+class MultiModalEncDecInputs(MultiModalInputs):
+    """
+    Represents the outputs of
+    [`EncDecMultiModalProcessor`][vllm.multimodal.processing.EncDecMultiModalProcessor]
+    ready to be passed to vLLM internals.
+    """
+
+    encoder_prompt: str
+    """The processed encoder prompt text."""
+
+    encoder_prompt_token_ids: list[int]
+    """The processed token IDs of the encoder prompt."""

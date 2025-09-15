@@ -1,10 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import ast
 import json
-import re
-from typing import Any, Sequence, Tuple, Union
+from collections.abc import Sequence
+from typing import Any, Union
 
+import regex as re
 from transformers import PreTrainedTokenizerBase
 
+import vllm.envs as envs
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               DeltaFunctionCall, DeltaMessage,
                                               DeltaToolCall,
@@ -25,7 +30,7 @@ class _UnexpectedAstError(Exception):
 class PythonicToolParser(ToolParser):
     """
     Tool call parser for models that produce tool calls in a pythonic style,
-    such as Llama 3.2 models.
+    such as Llama 3.2 and Llama 4 models.
 
     Used when --enable-auto-tool-choice --tool-call-parser pythonic are all set
     """
@@ -58,8 +63,18 @@ class PythonicToolParser(ToolParser):
         """
         Extract the tool calls from a complete model response.
         """
+        is_tool_call_pattern = False
+        try:
+            is_tool_call_pattern = self.TOOL_CALL_REGEX.match(
+                model_output,
+                timeout=envs.VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS) is not None
+        except TimeoutError:
+            logger.warning(
+                "Regex timeout occurred when matching tool call pattern.")
+            logger.debug("Regex timeout occurred when matching user input: %s",
+                         model_output)
 
-        if not (self.TOOL_CALL_REGEX.match(model_output)):
+        if not is_tool_call_pattern:
             return ExtractedToolCallInformation(tools_called=False,
                                                 tool_calls=[],
                                                 content=model_output)
@@ -150,7 +165,7 @@ class PythonicToolParser(ToolParser):
                             index] += delta.function.arguments
 
             # HACK: serving_chat.py inspects the internal state of tool parsers
-            # when determining it's final streaming delta, automatically
+            # when determining its final streaming delta, automatically
             # adding autocompleted JSON.
             # These two lines avoid that nonsense while ensuring finish_reason
             # is set to tool_calls when at least one tool is called.
@@ -197,12 +212,15 @@ def _handle_single_tool(call: ast.Call) -> ToolCall:
     arguments = {}
     for keyword in call.keywords:
         arguments[keyword.arg] = _get_parameter_value(keyword.value)
-    return ToolCall(type="function",
-                    function=FunctionCall(name=function_name,
-                                          arguments=json.dumps(arguments)))
+    return ToolCall(
+        type="function",
+        function=FunctionCall(name=function_name,
+                              arguments=json.dumps(arguments,
+                                                   ensure_ascii=False)),
+    )
 
 
-def _make_valid_python(text: str) -> Union[Tuple[str, str], None]:
+def _make_valid_python(text: str) -> Union[tuple[str, str], None]:
     bracket_stack = []
     for index, char in enumerate(text):
         if char in {"[", "(", "{"}:
@@ -277,6 +295,7 @@ def _compute_tool_delta(previously_sent_args: str, new_call: ToolCall,
         new_call_args = new_call_args[:-len(withheld_suffix)]
     if not previously_sent_args:
         return DeltaToolCall(id=new_call.id,
+                             type="function",
                              index=index,
                              function=DeltaFunctionCall(
                                  name=new_call.function.name,
@@ -285,5 +304,5 @@ def _compute_tool_delta(previously_sent_args: str, new_call: ToolCall,
 
     arg_diff = new_call_args[len(previously_sent_args):]
     return DeltaToolCall(
-        id="", index=index, function=DeltaFunctionCall(
+        id=None, index=index, function=DeltaFunctionCall(
             arguments=arg_diff)) if arg_diff else None

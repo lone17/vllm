@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from collections import deque
 from typing import Deque, FrozenSet, Iterable, List, Optional, Tuple, Union
 
@@ -179,7 +182,7 @@ class NaiveBlockAllocator(BlockAllocator):
             # Increment refcount for each block.
             assert block.block_id is not None
             refcount = self._refcounter.incr(block.block_id)
-            assert refcount != 1, "can't fork free'd block"
+            assert refcount != 1, "can't fork freed block"
 
             forked_block = self._block_pool.init_block(
                 prev_block=prev_block,
@@ -204,7 +207,7 @@ class NaiveBlockAllocator(BlockAllocator):
 
         Args:
             absolute_id (int): The absolute block id for the block 
-            in whole allocator.
+                in whole allocator.
 
         Returns:
             int: The zero-offset block id on certain device.

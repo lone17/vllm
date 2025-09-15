@@ -1,7 +1,11 @@
-from vllm.attention.backends.flash_attn import FlashAttentionBackend
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from vllm.attention.backends.placeholder_attn import (
+    PlaceholderAttentionBackend)
 
 
-class DummyAttentionBackend(FlashAttentionBackend):
+class DummyAttentionBackend(PlaceholderAttentionBackend):
 
     @staticmethod
     def get_name() -> str:

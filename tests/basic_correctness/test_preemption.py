@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compare the short outputs of HF and vLLM when using greedy sampling.
 
 VLLM_TEST_ENABLE_ARTIFICIAL_PREEMPT=1 has to be set before running this test.
@@ -16,8 +18,17 @@ from vllm.core.scheduler import (ARTIFICIAL_PREEMPTION_MAX_CNT,
 from ..models.utils import check_outputs_equal
 
 MODELS = [
-    "facebook/opt-125m",
+    "distilbert/distilgpt2",
 ]
+
+
+@pytest.fixture(scope="function", autouse=True)
+def use_v0_only(monkeypatch):
+    """
+    We should enable this for V1, but VLLM_TEST_ENABLE_ARTIFICIAL_PREEMPT,
+    so use VLLM_USE_V1=0 for all tests in the file.
+    """
+    monkeypatch.setenv('VLLM_USE_V1', '0')
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -70,7 +81,7 @@ def test_chunked_prefill_recompute(
             disable_log_stats=False,
     ) as vllm_model:
         vllm_outputs = vllm_model.generate_greedy(example_prompts, max_tokens)
-        assert (vllm_model.model.llm_engine.scheduler[0].artificial_preempt_cnt
+        assert (vllm_model.llm.llm_engine.scheduler[0].artificial_preempt_cnt
                 < ARTIFICIAL_PREEMPTION_MAX_CNT)
 
     for i in range(len(example_prompts)):
@@ -107,10 +118,10 @@ def test_preemption(
             distributed_executor_backend=distributed_executor_backend,
     ) as vllm_model:
         vllm_outputs = vllm_model.generate_greedy(example_prompts, max_tokens)
-        assert (vllm_model.model.llm_engine.scheduler[0].artificial_preempt_cnt
+        assert (vllm_model.llm.llm_engine.scheduler[0].artificial_preempt_cnt
                 < ARTIFICIAL_PREEMPTION_MAX_CNT)
         total_preemption = (
-            vllm_model.model.llm_engine.scheduler[0].num_cumulative_preemption)
+            vllm_model.llm.llm_engine.scheduler[0].num_cumulative_preemption)
 
     check_outputs_equal(
         outputs_0_lst=hf_outputs,
@@ -163,12 +174,12 @@ def test_preemption_infeasible(
     ) as vllm_model:
         sampling_params = SamplingParams(max_tokens=max_tokens,
                                          ignore_eos=True)
-        req_outputs = vllm_model.model.generate(
+        req_outputs = vllm_model.llm.generate(
             example_prompts,
             sampling_params=sampling_params,
         )
 
-        assert (vllm_model.model.llm_engine.scheduler[0].artificial_preempt_cnt
+        assert (vllm_model.llm.llm_engine.scheduler[0].artificial_preempt_cnt
                 < ARTIFICIAL_PREEMPTION_MAX_CNT)
 
     # Verify the request is ignored and not hang.

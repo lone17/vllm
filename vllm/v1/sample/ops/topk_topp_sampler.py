@@ -1,9 +1,14 @@
-from typing import Dict
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from typing import Optional
 
 import torch
 import torch.nn as nn
+from packaging import version
 
 from vllm import envs
+from vllm.config import LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -17,12 +22,31 @@ except ImportError:
 
 
 class TopKTopPSampler(nn.Module):
+    """
+    Module that performs optional top-k and top-p filtering followed by
+    weighted random sampling of logits.
 
-    def __init__(self):
+    Implementations may update the logits tensor in-place.
+    """
+
+    def __init__(
+            self,
+            logprobs_mode: LogprobsMode = LogprobsMode.RAW_LOGPROBS) -> None:
         super().__init__()
-        if current_platform.is_cuda:
+        self.logprobs_mode = logprobs_mode
+        # flashinfer optimization does not apply if intermediate
+        # logprobs/logits after top_k/top_p need to be returned
+        if logprobs_mode not in (LogprobsMode.PROCESSED_LOGITS,
+                                 LogprobsMode.PROCESSED_LOGPROBS
+                                 ) and current_platform.is_cuda():
             if is_flashinfer_available:
-                if envs.VLLM_USE_FLASHINFER_SAMPLER is not False:
+                flashinfer_version = flashinfer.__version__
+                if version.parse(flashinfer_version) < version.parse("0.2.3"):
+                    logger.warning_once(
+                        "FlashInfer version >= 0.2.3 required. "
+                        "Falling back to default sampling implementation.")
+                    self.forward = self.forward_native
+                elif envs.VLLM_USE_FLASHINFER_SAMPLER is not False:
                     # NOTE(woosuk): The V0 sampler doesn't use FlashInfer for
                     # sampling unless VLLM_USE_FLASHINFER_SAMPLER=1 (i.e., by
                     # default it is unused). For backward compatibility, we set
@@ -31,17 +55,18 @@ class TopKTopPSampler(nn.Module):
                     # None means False, while in V1, None means True. This is
                     # why we use the condition
                     # `envs.VLLM_USE_FLASHINFER_SAMPLER is not False` here.
-                    logger.info("Using FlashInfer for top-p & top-k sampling.")
+                    logger.info_once(
+                        "Using FlashInfer for top-p & top-k sampling.")
                     self.forward = self.forward_cuda
                 else:
-                    logger.warning(
+                    logger.warning_once(
                         "FlashInfer is available, but it is not enabled. "
                         "Falling back to the PyTorch-native implementation of "
                         "top-p & top-k sampling. For the best performance, "
                         "please set VLLM_USE_FLASHINFER_SAMPLER=1.")
                     self.forward = self.forward_native
             else:
-                logger.warning(
+                logger.warning_once(
                     "FlashInfer is not available. Falling back to the PyTorch-"
                     "native implementation of top-p & top-k sampling. For the "
                     "best performance, please install FlashInfer.")
@@ -49,66 +74,88 @@ class TopKTopPSampler(nn.Module):
         else:
             self.forward = self.forward_native
 
+        self.apply_top_k_top_p = apply_top_k_top_p
+
     def forward_native(
         self,
         logits: torch.Tensor,
-        generators: Dict[int, torch.Generator],
-        no_top_k: bool,
-        k: torch.Tensor,
-        no_top_p: bool,
-        p: torch.Tensor,
-    ) -> torch.Tensor:
-        """PyTorch-native implementation of top-k and top-p sampling."""
-        logits = apply_top_k_top_p(logits, no_top_k, k, no_top_p, p)
+        generators: dict[int, torch.Generator],
+        k: Optional[torch.Tensor],
+        p: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        PyTorch-native implementation of top-k and top-p sampling.
+
+        The logits tensor may be updated in-place.
+        """
+        logits = self.apply_top_k_top_p(logits, k, p)
+        logits_to_return = None
+        if self.logprobs_mode == LogprobsMode.PROCESSED_LOGITS:
+            logits_to_return = logits
+        elif self.logprobs_mode == LogprobsMode.PROCESSED_LOGPROBS:
+            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
-        return random_sample(probs, generators)
+        return random_sample(probs, generators), logits_to_return
 
     def forward_cuda(
         self,
         logits: torch.Tensor,
-        generators: Dict[int, torch.Generator],
-        no_top_k: bool,
-        k: torch.Tensor,
-        no_top_p: bool,
-        p: torch.Tensor,
-    ) -> torch.Tensor:
+        generators: dict[int, torch.Generator],
+        k: Optional[torch.Tensor],
+        p: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """More optimized implementation for top-k and top-p sampling."""
-        probs = logits.softmax(dim=-1, dtype=torch.float32)
-        if no_top_k and no_top_p:
-            # We prefer `random_sample` over `flashinfer_sample` when sorting is
-            # not needed. This is because `random_sample` does not require
-            # CPU-GPU synchronization while `flashinfer_sample` does.
-            return random_sample(probs, generators)
-        return flashinfer_sample(probs, no_top_k, k, no_top_p, p, generators)
+        # We prefer `random_sample` over `flashinfer_sample` when sorting is
+        # not needed. This is because `random_sample` does not require
+        # CPU-GPU synchronization while `flashinfer_sample` does.
+        if (k is None and p is None) or generators:
+            if generators:
+                logger.warning_once("FlashInfer 0.2.3+ does not support "
+                                    "per-request generators. Falling back to "
+                                    "PyTorch-native implementation.")
+            return self.forward_native(logits, generators, k, p)
+        assert self.logprobs_mode not in (
+            LogprobsMode.PROCESSED_LOGITS, LogprobsMode.PROCESSED_LOGPROBS
+        ), "FlashInfer does not support returning logits/logprobs"
+        # flashinfer sampling functions expect contiguous logits.
+        # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
+        # because of slicing operation in logits_processor.
+        return flashinfer_sample(logits.contiguous(), k, p, generators), None
 
 
 def apply_top_k_top_p(
     logits: torch.Tensor,
-    no_top_k: bool,
-    k: torch.Tensor,
-    no_top_p: bool,
-    p: torch.Tensor,
+    k: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits.
 
-    This function sorts the logits tensor, which can be slow for large batches.
+    If a top-p is used, this function will sort the logits tensor,
+    which can be slow for large batches.
+
+    The logits tensor may be updated in-place.
     """
-    if no_top_k and no_top_p:
-        return logits
+    if p is None:
+        if k is None:
+            return logits
+
+        # Avoid sorting vocab for top-k only case.
+        return apply_top_k_only(logits, k)
+
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
-    if not no_top_k:
+    if k is not None:
         # Apply top-k.
-        top_k_mask = logits_sort.size(1) - k.to(torch.long)
+        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
         # Get all the top_k values.
         top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
         top_k_mask = logits_sort < top_k_mask
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
-    if not no_top_p:
+    if p is not None:
         # Apply top-p.
         probs_sort = logits_sort.softmax(dim=-1)
-        probs_sum = probs_sort.cumsum(dim=-1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
         top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
         # at least one
         top_p_mask[:, -1] = False
@@ -119,9 +166,34 @@ def apply_top_k_top_p(
     return logits
 
 
+def apply_top_k_only(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply top-k mask to the logits.
+
+    This implementation doesn't involve sorting the entire vocab.
+
+    The logits tensor may be updated in-place.
+    """
+    no_top_k_mask = k == logits.shape[1]
+    # Set non-top-k rows to 1 so that we can gather.
+    k = k.masked_fill(no_top_k_mask, 1)
+    max_top_k = k.max()
+    # topk.values tensor has shape [batch_size, max_top_k].
+    # Convert top k to 0-based index in range [0, max_top_k).
+    k_index = k.sub_(1).unsqueeze(1)
+    top_k_mask = logits.topk(max_top_k, dim=1).values.gather(1, k_index.long())
+    # Handle non-topk rows.
+    top_k_mask.masked_fill_(no_top_k_mask.unsqueeze(1), -float("inf"))
+    logits.masked_fill_(logits < top_k_mask, -float("inf"))
+    return logits
+
+
 def random_sample(
     probs: torch.Tensor,
-    generators: Dict[int, torch.Generator],
+    generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
     """Randomly sample from the probabilities.
 
@@ -144,19 +216,17 @@ def random_sample(
 
 
 def flashinfer_sample(
-    probs: torch.Tensor,
-    no_top_k: bool,
-    k: torch.Tensor,
-    no_top_p: bool,
-    p: torch.Tensor,
-    generators: Dict[int, torch.Generator],
+    logits: torch.Tensor,
+    k: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
+    generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    """Sample from the probabilities using FlashInfer.
+    """Sample from the logits using FlashInfer.
 
     Statistically, this function is equivalent to the `random_sample` function.
     However, this function is faster because it avoids sorting the logits tensor
     via rejection sampling.
-    
+
     NOTE: The outputs of this function do not necessarily match the outputs of
     the `random_sample` function. It only guarantees that the outputs are
     statistically equivalent.
@@ -165,37 +235,20 @@ def flashinfer_sample(
     does not. Call this function at the end of the forward pass to minimize
     the synchronization overhead.
     """
-    assert not (no_top_k and no_top_p)
-    max_top_k_round = 32
-    batch_size = probs.shape[0]
-    uniform_samples = torch.empty((max_top_k_round, batch_size),
-                                  device=probs.device)
-    if len(generators) != batch_size:
-        uniform_samples.uniform_()
-    if generators:
-        for i, generator in generators.items():
-            uniform_samples[:, i].uniform_(generator=generator)
-
-    if no_top_k:
+    assert not (k is None and p is None)
+    if k is None:
         # Top-p only.
-        next_token_ids, success = flashinfer.sampling.top_p_sampling_from_probs(
-            probs, uniform_samples, p, deterministic=True)
-    elif no_top_p:
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
+            probs, p, deterministic=True)
+    elif p is None:
         # Top-k only.
-        next_token_ids, success = flashinfer.sampling.top_k_sampling_from_probs(
-            probs, uniform_samples, k, deterministic=True)
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
+            probs, k, deterministic=True)
     else:
         # Both top-k and top-p.
-        next_token_ids, success = (
-            flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, uniform_samples, k, p, deterministic=True))
+        next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            logits, k, p, deterministic=True)
 
-    # NOTE: CPU-GPU synchronization happens here.
-    if not success.all():
-        if not no_top_k:
-            probs = flashinfer.sampling.top_k_renorm_prob(probs, k)
-        if not no_top_p:
-            probs = flashinfer.sampling.top_p_renorm_prob(probs, p)
-        next_token_ids = flashinfer.sampling.sampling_from_probs(
-            probs, uniform_samples[0], deterministic=True)
     return next_token_ids.view(-1)

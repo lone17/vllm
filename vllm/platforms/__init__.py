@@ -1,10 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import traceback
 from itertools import chain
 from typing import TYPE_CHECKING, Optional
 
+from vllm import envs
 from vllm.plugins import load_plugins_by_group
-from vllm.utils import resolve_obj_by_qualname
+from vllm.utils import resolve_obj_by_qualname, supports_xccl
 
 from .interface import _Backend  # noqa: F401
 from .interface import CpuArchEnum, Platform, PlatformEnum
@@ -12,33 +15,76 @@ from .interface import CpuArchEnum, Platform, PlatformEnum
 logger = logging.getLogger(__name__)
 
 
+def vllm_version_matches_substr(substr: str) -> bool:
+    """
+    Check to see if the vLLM version matches a substring.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        vllm_version = version("vllm")
+    except PackageNotFoundError as e:
+        logger.warning(
+            "The vLLM package was not found, so its version could not be "
+            "inspected. This may cause platform detection to fail.")
+        raise e
+    return substr in vllm_version
+
+
 def tpu_platform_plugin() -> Optional[str]:
-    is_tpu = False
+    logger.debug("Checking if TPU platform is available.")
+
+    # Check for Pathways TPU proxy
+    if envs.VLLM_TPU_USING_PATHWAYS:
+        logger.debug("Confirmed TPU platform is available via Pathways proxy.")
+        return "tpu_commons.platforms.tpu_jax.TpuPlatform"
+
+    # Check for libtpu installation
     try:
         # While it's technically possible to install libtpu on a
         # non-TPU machine, this is a very uncommon scenario. Therefore,
-        # we assume that libtpu is installed if and only if the machine
+        # we assume that libtpu is installed only if the machine
         # has TPUs.
-        import libtpu  # noqa: F401
-        is_tpu = True
-    except Exception:
-        pass
 
-    return "vllm.platforms.tpu.TpuPlatform" if is_tpu else None
+        import libtpu  # noqa: F401
+        logger.debug("Confirmed TPU platform is available.")
+        return "vllm.platforms.tpu.TpuPlatform"
+    except Exception as e:
+        logger.debug("TPU platform is not available because: %s", str(e))
+        return None
 
 
 def cuda_platform_plugin() -> Optional[str]:
     is_cuda = False
-
+    logger.debug("Checking if CUDA platform is available.")
     try:
-        import pynvml
+        from vllm.utils import import_pynvml
+        pynvml = import_pynvml()
         pynvml.nvmlInit()
         try:
-            if pynvml.nvmlDeviceGetCount() > 0:
-                is_cuda = True
+            # NOTE: Edge case: vllm cpu build on a GPU machine.
+            # Third-party pynvml can be imported in cpu build,
+            # we need to check if vllm is built with cpu too.
+            # Otherwise, vllm will always activate cuda plugin
+            # on a GPU machine, even if in a cpu build.
+            is_cuda = (pynvml.nvmlDeviceGetCount() > 0
+                       and not vllm_version_matches_substr("cpu"))
+            if pynvml.nvmlDeviceGetCount() <= 0:
+                logger.debug(
+                    "CUDA platform is not available because no GPU is found.")
+            if vllm_version_matches_substr("cpu"):
+                logger.debug("CUDA platform is not available because"
+                             " vLLM is built with CPU.")
+            if is_cuda:
+                logger.debug("Confirmed CUDA platform is available.")
         finally:
             pynvml.nvmlShutdown()
-    except Exception:
+    except Exception as e:
+        logger.debug("Exception happens when checking CUDA platform: %s",
+                     str(e))
+        if "nvml" not in e.__class__.__name__.lower():
+            # If the error is not related to NVML, re-raise it.
+            raise e
+
         # CUDA is supported on Jetson, but NVML may not be.
         import os
 
@@ -47,101 +93,88 @@ def cuda_platform_plugin() -> Optional[str]:
                 or os.path.exists("/sys/class/tegra-firmware")
 
         if cuda_is_jetson():
+            logger.debug("Confirmed CUDA platform is available on Jetson.")
             is_cuda = True
+        else:
+            logger.debug("CUDA platform is not available because: %s", str(e))
 
     return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
 
 
 def rocm_platform_plugin() -> Optional[str]:
     is_rocm = False
-
+    logger.debug("Checking if ROCm platform is available.")
     try:
         import amdsmi
         amdsmi.amdsmi_init()
         try:
             if len(amdsmi.amdsmi_get_processor_handles()) > 0:
                 is_rocm = True
+                logger.debug("Confirmed ROCm platform is available.")
+            else:
+                logger.debug("ROCm platform is not available because"
+                             " no GPU is found.")
         finally:
             amdsmi.amdsmi_shut_down()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("ROCm platform is not available because: %s", str(e))
 
     return "vllm.platforms.rocm.RocmPlatform" if is_rocm else None
 
 
-def hpu_platform_plugin() -> Optional[str]:
-    is_hpu = False
-    try:
-        from importlib import util
-        is_hpu = util.find_spec('habana_frameworks') is not None
-    except Exception:
-        pass
-
-    return "vllm.platforms.hpu.HpuPlatform" if is_hpu else None
-
-
 def xpu_platform_plugin() -> Optional[str]:
     is_xpu = False
-
+    logger.debug("Checking if XPU platform is available.")
     try:
         # installed IPEX if the machine has XPUs.
         import intel_extension_for_pytorch  # noqa: F401
-        import oneccl_bindings_for_pytorch  # noqa: F401
         import torch
+        if supports_xccl():
+            dist_backend = "xccl"
+        else:
+            dist_backend = "ccl"
+            import oneccl_bindings_for_pytorch  # noqa: F401
+
         if hasattr(torch, 'xpu') and torch.xpu.is_available():
             is_xpu = True
-    except Exception:
-        pass
+            from vllm.platforms.xpu import XPUPlatform
+            XPUPlatform.dist_backend = dist_backend
+            logger.debug("Confirmed %s backend is available.",
+                         XPUPlatform.dist_backend)
+            logger.debug("Confirmed XPU platform is available.")
+    except Exception as e:
+        logger.debug("XPU platform is not available because: %s", str(e))
 
     return "vllm.platforms.xpu.XPUPlatform" if is_xpu else None
 
 
 def cpu_platform_plugin() -> Optional[str]:
     is_cpu = False
+    logger.debug("Checking if CPU platform is available.")
     try:
-        from importlib.metadata import version
-        is_cpu = "cpu" in version("vllm")
+        is_cpu = vllm_version_matches_substr("cpu")
+        if is_cpu:
+            logger.debug("Confirmed CPU platform is available because"
+                         " vLLM is built with CPU.")
         if not is_cpu:
-            import platform
-            is_cpu = platform.machine().lower().startswith("arm")
+            import sys
+            is_cpu = sys.platform.startswith("darwin")
+            if is_cpu:
+                logger.debug("Confirmed CPU platform is available"
+                             " because the machine is MacOS.")
 
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("CPU platform is not available because: %s", str(e))
 
     return "vllm.platforms.cpu.CpuPlatform" if is_cpu else None
-
-
-def neuron_platform_plugin() -> Optional[str]:
-    is_neuron = False
-    try:
-        import transformers_neuronx  # noqa: F401
-        is_neuron = True
-    except ImportError:
-        pass
-
-    return "vllm.platforms.neuron.NeuronPlatform" if is_neuron else None
-
-
-def openvino_platform_plugin() -> Optional[str]:
-    is_openvino = False
-    try:
-        from importlib.metadata import version
-        is_openvino = "openvino" in version("vllm")
-    except Exception:
-        pass
-
-    return "vllm.platforms.openvino.OpenVinoPlatform" if is_openvino else None
 
 
 builtin_platform_plugins = {
     'tpu': tpu_platform_plugin,
     'cuda': cuda_platform_plugin,
     'rocm': rocm_platform_plugin,
-    'hpu': hpu_platform_plugin,
     'xpu': xpu_platform_plugin,
     'cpu': cpu_platform_plugin,
-    'neuron': neuron_platform_plugin,
-    'openvino': openvino_platform_plugin,
 }
 
 

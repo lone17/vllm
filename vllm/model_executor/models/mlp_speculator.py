@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import math
-from typing import Iterable, List, Set, Tuple
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -62,7 +65,7 @@ class MLPSpeculator(nn.Module):
     https://arxiv.org/pdf/2404.19124
 
     Trained speculators of this type are available on HF hub at:
-    https://huggingface.co/ibm-fms and https://huggingface.co/ibm-granite
+    https://huggingface.co/ibm-ai-platform and https://huggingface.co/ibm-granite
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -146,7 +149,7 @@ class MLPSpeculator(nn.Module):
         previous_hidden_states: torch.Tensor,
         num_predict_tokens: int,
         sampling_metadata: SamplingMetadata,
-    ) -> List[SamplerOutput]:
+    ) -> list[SamplerOutput]:
         if num_predict_tokens > self.max_speculative_tokens:
             raise ValueError(f"Max speculative tokens for model is "
                              f"{self.max_speculative_tokens}, but "
@@ -188,10 +191,10 @@ class MLPSpeculator(nn.Module):
 
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             name = name.replace("speculator.", "")
             param = params_dict.get(name)

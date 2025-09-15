@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import asyncio
 import os
 from collections import defaultdict
@@ -16,6 +19,7 @@ from vllm.executor.ray_utils import (RayWorkerWrapper, initialize_ray_cluster,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.platforms import current_platform
+from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.sequence import ExecuteModelRequest
 from vllm.utils import (_run_task_with_lock, get_distributed_init_method,
                         get_ip, get_open_port, make_async)
@@ -46,15 +50,30 @@ class RayWorkerMetaData:
 
 
 class RayDistributedExecutor(DistributedExecutorBase):
+    """Ray-based distributed executor"""
+
+    # These env vars are worker-specific, therefore are NOT copied
+    # from the driver to the workers
+    WORKER_SPECIFIC_ENV_VARS = {
+        "VLLM_HOST_IP", "VLLM_HOST_PORT", "LOCAL_RANK", "CUDA_VISIBLE_DEVICES"
+    }
+
+    # These non-vLLM env vars are copied from the driver to workers
+    ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
     uses_ray: bool = True
 
     def _init_executor(self) -> None:
         self.forward_dag: Optional[ray.dag.CompiledDAG] = None
         if envs.VLLM_USE_V1:
-            # v1 always uses the compiled DAG and SPMD worker.
+            # V1 uses SPMD worker and compiled DAG
             os.environ["VLLM_USE_RAY_SPMD_WORKER"] = "1"
             os.environ["VLLM_USE_RAY_COMPILED_DAG"] = "1"
+
+            # For TPU or XPU, avoid compiling NVIDIA's NCCL
+            if current_platform.is_tpu() or current_platform.is_xpu():
+                os.environ["VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE"] = "shm"
+
         # If the env var is set, it uses the Ray's compiled DAG API
         # which optimizes the control plane overhead.
         # Run vLLM with VLLM_USE_RAY_COMPILED_DAG=1 to enable it.
@@ -93,12 +112,17 @@ class RayDistributedExecutor(DistributedExecutorBase):
         self.use_v1 = envs.VLLM_USE_V1
 
         self.pp_locks: Optional[List[asyncio.Lock]] = None
-        self.use_ray_spmd_worker = envs.VLLM_USE_RAY_SPMD_WORKER
         if not self.use_ray_compiled_dag:
             self.driver_exec_method = make_async(
                 self.driver_worker.execute_method)
 
     def shutdown(self) -> None:
+        if logger:
+            # Somehow logger can be None here.
+            logger.info(
+                "Shutting down Ray distributed executor. If you see error log "
+                "from logging.cc regarding SIGTERM received, please ignore "
+                "because this is the expected termination process in Ray.")
         if hasattr(self, "forward_dag") and self.forward_dag is not None:
             self.forward_dag.teardown()
             import ray
@@ -127,13 +151,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
 
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
-        if (self.parallel_config.tensor_parallel_size == 1
-                and self.parallel_config.pipeline_parallel_size == 1):
-            # For single GPU case, we use a ray worker with constrained memory.
-            num_gpus = self.cache_config.gpu_memory_utilization
-        else:
-            # Otherwise, the ray workers are allocated with a full GPU.
-            num_gpus = 1
+        num_gpus = envs.VLLM_RAY_PER_WORKER_GPUS
 
         # The driver dummy worker does not actually use any resources.
         # It holds the resource for the driver worker.
@@ -153,12 +171,29 @@ class RayDistributedExecutor(DistributedExecutorBase):
         logger.info("use_ray_spmd_worker: %s", self.use_ray_spmd_worker)
 
         # Create the workers.
-        driver_ip = get_ip()
-        rank = 0
+        bundle_indices: List[int]
+        if envs.VLLM_RAY_BUNDLE_INDICES:
+            # Use the bundle indices specified by the user.
+            bundle_indices = list(
+                map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(",")))
+            assert len(bundle_indices) == self.parallel_config.world_size, \
+            ("VLLM_RAY_BUNDLE_INDICES must have the same size"
+            f" as the world size, but got {bundle_indices=} "
+            f"and {self.parallel_config.world_size=}")
+            assert len(set(bundle_indices)) == len(bundle_indices), \
+            ("VLLM_RAY_BUNDLE_INDICES cannot have duplicate values,"
+            f" but got {bundle_indices=}")
+        else:
+            # use the first N bundles that have GPU resources.
+            bundle_indices = []
+            for bundle_id, bundle in enumerate(placement_group.bundle_specs):
+                if bundle.get(current_platform.ray_device_key, 0):
+                    bundle_indices.append(bundle_id)
+            bundle_indices = bundle_indices[:self.parallel_config.world_size]
+
         worker_metadata: List[RayWorkerMetaData] = []
-        for bundle_id, bundle in enumerate(placement_group.bundle_specs):
-            if not bundle.get(current_platform.ray_device_key, 0):
-                continue
+        driver_ip = get_ip()
+        for rank, bundle_id in enumerate(bundle_indices):
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=placement_group,
                 placement_group_capture_child_tasks=True,
@@ -185,7 +220,6 @@ class RayDistributedExecutor(DistributedExecutorBase):
                                            rpc_rank=rank)
             worker_metadata.append(
                 RayWorkerMetaData(worker=worker, created_rank=rank))
-            rank += 1
 
         worker_ips = ray.get([
             each.worker.get_node_ip.remote()  # type: ignore[attr-defined]
@@ -213,9 +247,10 @@ class RayDistributedExecutor(DistributedExecutorBase):
         logger.debug("driver_dummy_worker: %s", self.driver_dummy_worker)
         if not self.use_ray_spmd_worker and self.driver_dummy_worker is None:
             raise ValueError(
-                "Ray does not allocate any GPUs on the driver node. Consider "
-                "adjusting the Ray placement group or running the driver on a "
-                "GPU node.")
+                "Ray does not allocate any GPUs on the driver node."
+                f"Driver IP: {driver_ip}, worker IPs: {worker_ips}."
+                "Consider adjusting the Ray placement group or running "
+                "the driver on a GPU node.")
 
         ip_counts: Dict[str, int] = {}
         for ip in worker_ips:
@@ -293,16 +328,17 @@ class RayDistributedExecutor(DistributedExecutorBase):
             ",".join(map(str, node_gpus[node_id])),
         } for (node_id, _) in worker_node_and_gpu_ids]
 
+        # Environment variables to copy from driver to workers
+        env_vars_to_copy = get_env_vars_to_copy(
+            exclude_vars=self.WORKER_SPECIFIC_ENV_VARS,
+            additional_vars=set(current_platform.additional_env_vars).union(
+                self.ADDITIONAL_ENV_VARS),
+            destination="workers")
+
+        # Copy existing env vars to each worker's args
         for args in all_args_to_update_environment_variables:
-            # some carry-over env vars from the driver
             # TODO: refactor platform-specific env vars
-            for name in [
-                    "VLLM_ATTENTION_BACKEND",
-                    "TPU_CHIPS_PER_HOST_BOUNDS",
-                    "TPU_HOST_BOUNDS",
-                    "VLLM_USE_V1",
-                    "VLLM_TRACE_FUNCTION",
-            ]:
+            for name in env_vars_to_copy:
                 if name in os.environ:
                     args[name] = os.environ[name]
 
@@ -475,47 +511,71 @@ class RayDistributedExecutor(DistributedExecutorBase):
         async_run_remote_workers_only to complete."""
         ray.get(parallel_worker_tasks)
 
-    def _check_ray_adag_installation(self):
-        import pkg_resources
+    def _check_ray_cgraph_installation(self):
+        import importlib.metadata
+
         from packaging import version
 
-        required_version = version.parse("2.40")
-        current_version = version.parse(
-            pkg_resources.get_distribution("ray").version)
+        required_version = version.parse("2.43.0")
+        current_version = version.parse(importlib.metadata.version("ray"))
         if current_version < required_version:
             raise ValueError(f"Ray version {required_version} is "
                              f"required, but found {current_version}")
 
         import importlib.util
-        adag_spec = importlib.util.find_spec(
+        cgraph_spec = importlib.util.find_spec(
             "ray.experimental.compiled_dag_ref")
-        if adag_spec is None:
-            raise ValueError("Ray accelerated DAG is not installed. "
-                             "Run `pip install ray[adag]` to install it.")
+        if cgraph_spec is None:
+            raise ValueError("Ray Compiled Graph is not installed. "
+                             "Run `pip install ray[cgraph]` to install it.")
 
         cupy_spec = importlib.util.find_spec("cupy")
-        if cupy_spec is None and envs.VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL:
+        if (cupy_spec is None
+                and envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE == "nccl"):
             raise ValueError(
                 "cupy is not installed but required since "
-                "VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL is set."
-                "Run `pip install ray[adag]` and check cupy installation.")
+                "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE is set to 'nccl'. "
+                "Run `pip install ray[cgraph]` and check cupy installation.")
 
     def _compiled_ray_dag(self, enable_asyncio: bool):
         assert self.parallel_config.use_ray
-        self._check_ray_adag_installation()
+        self._check_ray_cgraph_installation()
+        # Enlarge the default value of "RAY_CGRAPH_get_timeout" to 300 seconds
+        # (it is 10 seconds by default). This is a Ray environment variable to
+        # control the timeout of getting result from a compiled graph execution,
+        # i.e., the distributed execution that includes model forward runs and
+        # intermediate tensor communications, in the case of vllm.
+        # Note: we should set this env var before importing
+        # ray.dag, otherwise it will not take effect.
+        os.environ.setdefault("RAY_CGRAPH_get_timeout", "300")  # noqa: SIM112
         from ray.dag import InputNode, MultiOutputNode
-        from ray.experimental.channel.torch_tensor_type import TorchTensorType
-
-        logger.info("VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL = %s",
-                    envs.VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL)
+        logger.info("RAY_CGRAPH_get_timeout is set to %s",
+                    os.environ["RAY_CGRAPH_get_timeout"])  # noqa: SIM112
+        logger.info("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE = %s",
+                    envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE)
         logger.info("VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM = %s",
                     envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM)
+
+        channel_type = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+        if channel_type not in ("auto", "nccl", "shm"):
+            raise ValueError(
+                "Invalid value for VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: "
+                f"{channel_type}. Valid values are: 'auto', 'nccl', or 'shm'.")
+
         with InputNode() as input_data:
             # Example DAG: PP=2, TP=4
-            # (ExecuteModelReq, None) -> 0 -> (ExecuteModelReq, IntermediateOutput) -> 4 -> SamplerOutput   # noqa: E501
-            #                         -> 1 -> (ExecuteModelReq, IntermediateOutput) -> 5 -> SamplerOutput   # noqa: E501
-            #                         -> 2 -> (ExecuteModelReq, IntermediateOutput) -> 6 -> SamplerOutput   # noqa: E501
-            #                         -> 3 -> (ExecuteModelReq, IntermediateOutput) -> 7 -> SamplerOutput   # noqa: E501
+            #
+            # For V0:
+            # ExecuteModelRequest -> 0 -> (ExecuteModelReq, IntermediateTensors) -> 4 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 1 -> (ExecuteModelReq, IntermediateTensors) -> 5 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 2 -> (ExecuteModelReq, IntermediateTensors) -> 6 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 3 -> (ExecuteModelReq, IntermediateTensors) -> 7 -> SamplerOutput   # noqa: E501
+            #
+            # For V1:
+            # SchedulerOutput -> 0 -> (SchedulerOutput, IntermediateTensors) -> 4 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 1 -> (SchedulerOutput, IntermediateTensors) -> 5 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 2 -> (SchedulerOutput, IntermediateTensors) -> 6 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 3 -> (SchedulerOutput, IntermediateTensors) -> 7 -> ModelRunnerOutput   # noqa: E501
 
             # All workers in the first TP group will take in the
             # ExecuteModelRequest as input.
@@ -525,7 +585,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
                 # and the TP group executes in SPMD fashion.
                 if self.use_v1:
                     outputs = [
-                        worker.execute_model.
+                        worker.execute_model_ray.
                         bind(  # type: ignore[attr-defined]
                             outputs[i]) for i, worker in enumerate(tp_group)
                     ]
@@ -537,20 +597,33 @@ class RayDistributedExecutor(DistributedExecutorBase):
                     ]
 
                 last_pp_rank = len(self.pp_tp_workers) - 1
-                if pp_rank < last_pp_rank:
+                if (pp_rank < last_pp_rank and
+                        envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE != "shm"):
                     # Specify how intermediate tensors should be passed
                     # between pp stages, no need to specify for the last
-                    # pp stage.
-                    transport = "nccl" \
-                        if envs.VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL \
-                        else "auto"
+                    # pp stage or when using shared memory (the default).
+                    transport = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
                     outputs = [
-                        output.with_type_hint(
-                            TorchTensorType(transport=transport))
+                        output.with_tensor_transport(transport=transport)
                         for output in outputs
                     ]
 
             forward_dag = MultiOutputNode(outputs)
+
+        if envs.VLLM_USE_RAY_WRAPPED_PP_COMM:
+            from ray.experimental.channel.accelerator_context import (
+                register_accelerator_context)
+
+            from vllm.distributed.device_communicators.ray_communicator import (
+                RayPPCommunicator)
+            register_accelerator_context(torch_module_name="cuda",
+                                         communicator_cls=RayPPCommunicator)
+            logger.info("Using RayPPCommunicator "
+                        "(which wraps vLLM _PP GroupCoordinator) "
+                        "for Ray Compiled Graph communication.")
+        else:
+            logger.info("Using Ray's NCCL communicator for "
+                        "Ray Compiled Graph communication.")
 
         return forward_dag.experimental_compile(
             enable_asyncio=enable_asyncio,

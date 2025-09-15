@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import os
 import time
 from collections import defaultdict
@@ -5,7 +8,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import msgspec
 
+import vllm.platforms
 from vllm.config import ParallelConfig
+from vllm.distributed import get_pp_group
 from vllm.executor.msgspec_utils import decode_hook, encode_hook
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -14,7 +19,7 @@ from vllm.utils import get_ip
 from vllm.worker.worker_base import WorkerWrapperBase
 
 if TYPE_CHECKING:
-    from vllm.v1.core.scheduler import SchedulerOutput
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -33,7 +38,7 @@ try:
 
     class RayWorkerWrapper(WorkerWrapperBase):
         """Ray wrapper for vllm.worker.Worker, allowing Worker to be
-        lazliy initialized after Ray sets CUDA_VISIBLE_DEVICES."""
+        lazily initialized after Ray sets CUDA_VISIBLE_DEVICES."""
 
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
@@ -52,10 +57,10 @@ try:
 
         def get_node_and_gpu_ids(self) -> Tuple[str, List[int]]:
             node_id = ray.get_runtime_context().get_node_id()
-            device_key = current_platform.ray_device_key
+            device_key = vllm.platforms.current_platform.ray_device_key
             if not device_key:
                 raise RuntimeError("current platform %s does not support ray.",
-                                   current_platform.device_name)
+                                   vllm.platforms.current_platform.device_name)
             gpu_ids = ray.get_runtime_context().get_accelerator_ids(
             )[device_key]
             return node_id, gpu_ids
@@ -81,12 +86,11 @@ try:
 
             execute_model_req = self.input_decoder.decode(serialized_req)
 
-            # TODO(swang): This is needed right now because Ray aDAG executes
-            # on a background thread, so we need to reset torch's current
-            # device.
-            import torch
+            # TODO(swang): This is needed right now because Ray Compiled Graph
+            # executes on a background thread, so we need to reset torch's
+            # current device.
             if not self.compiled_dag_cuda_device_set:
-                torch.cuda.set_device(self.worker.device)
+                current_platform.set_device(self.worker.device)
                 self.compiled_dag_cuda_device_set = True
 
             output = self.worker._execute_model_spmd(execute_model_req,
@@ -104,19 +108,40 @@ try:
             # on a background thread, so we need to reset torch's current
             # device.
             # We can remove this API after it is fixed in compiled graph.
-            import torch
             assert self.worker is not None, "Worker is not initialized"
             if not self.compiled_dag_cuda_device_set:
-                torch.cuda.set_device(self.worker.device)
+                if current_platform.is_tpu():
+                    # Not needed
+                    pass
+                else:
+                    current_platform.set_device(self.worker.device)
+
                 self.compiled_dag_cuda_device_set = True
 
-        def execute_model(
+        def execute_model_ray(
             self,
-            scheduler_output: "SchedulerOutput",
-        ) -> "ModelRunnerOutput":
+            scheduler_output: Union["SchedulerOutput",
+                                    Tuple["SchedulerOutput",
+                                          "IntermediateTensors"]],
+        ) -> Union["ModelRunnerOutput", Tuple["SchedulerOutput",
+                                              "IntermediateTensors"]]:
+            # This method is used by Ray Compiled Graph to execute the model,
+            # and it needs a special logic of self.setup_device_if_necessary()
             self.setup_device_if_necessary()
             assert self.worker is not None, "Worker is not initialized"
-            output = self.worker.model_runner.execute_model(scheduler_output)
+            if isinstance(scheduler_output, tuple):
+                scheduler_output, intermediate_tensors = scheduler_output
+            else:
+                scheduler_output, intermediate_tensors = scheduler_output, None
+            output = self.worker.model_runner.execute_model(
+                scheduler_output, intermediate_tensors)
+            if isinstance(output, IntermediateTensors):
+                output = scheduler_output, output
+            elif not get_pp_group().is_last_rank:
+                # Case where there are no scheduled requests
+                # but may still be finished requests.
+                assert not output or not output.req_ids
+                output = scheduler_output, None
             return output
 
         def override_env_vars(self, vars: Dict[str, str]):
@@ -126,7 +151,9 @@ try:
 
 except ImportError as e:
     ray = None  # type: ignore
-    ray_import_err = e
+    # only capture string to avoid variable references in the traceback that can
+    # prevent garbage collection in some cases
+    ray_import_err = str(e)
     RayWorkerWrapper = None  # type: ignore
 
 
@@ -138,8 +165,8 @@ def ray_is_available() -> bool:
 def assert_ray_available():
     """Raise an exception if Ray is not available."""
     if ray is None:
-        raise ValueError("Failed to import Ray, please install Ray with "
-                         "`pip install ray`.") from ray_import_err
+        raise ValueError(f"Failed to import Ray: {ray_import_err}."
+                         "Please install Ray with `pip install ray`.")
 
 
 def _verify_bundles(placement_group: "PlacementGroup",
@@ -170,8 +197,9 @@ def _verify_bundles(placement_group: "PlacementGroup",
             f"group {placement_group.id}. Node id -> bundles "
             f"{node_id_to_bundle}. "
             "You don't have enough GPUs available in a current node. Check "
-            "`ray status` to see if you have available GPUs in a node "
-            f"{driver_node_id} before starting an vLLM engine.")
+            "`ray status` and `ray list nodes` to see if you have available "
+            "GPUs in a node `{driver_node_id}` before starting an vLLM engine."
+        )
 
     for node_id, bundles in node_id_to_bundle.items():
         if len(bundles) < parallel_config.tensor_parallel_size:
@@ -195,7 +223,7 @@ def _wait_until_pg_ready(current_placement_group: "PlacementGroup"):
 
     """
     # Wait until PG is ready - this will block until all
-    # requested resources are available, and will timeout
+    # requested resources are available, and will time out
     # if they cannot be provisioned.
     placement_group_specs = current_placement_group.bundle_specs
 
@@ -211,8 +239,11 @@ def _wait_until_pg_ready(current_placement_group: "PlacementGroup"):
         wait_interval *= 2
         logger.info(
             "Waiting for creating a placement group of specs for "
-            "%d seconds. specs=%s. Check "
-            "`ray status` to see if you have enough resources.",
+            "%d seconds. specs=%s. Check `ray status` and "
+            "`ray list nodes` to see if you have enough resources,"
+            " and make sure the IP addresses used by ray cluster"
+            " are the same as VLLM_HOST_IP environment variable"
+            " specified in each node if you are running on a multi-node.",
             int(time.time() - s), placement_group_specs)
 
     try:
@@ -221,8 +252,8 @@ def _wait_until_pg_ready(current_placement_group: "PlacementGroup"):
         raise ValueError(
             "Cannot provide a placement group of "
             f"{placement_group_specs=} within {PG_WAIT_TIMEOUT} seconds. See "
-            "`ray status` to make sure the cluster has enough resources."
-        ) from None
+            "`ray status` and `ray list nodes` to make sure the cluster has "
+            "enough resources.") from None
 
 
 def _wait_until_pg_removed(current_placement_group: "PlacementGroup"):
@@ -260,24 +291,22 @@ def initialize_ray_cluster(
     assert_ray_available()
     from vllm.platforms import current_platform
 
-    # Connect to a ray cluster.
-    if current_platform.is_rocm() or current_platform.is_xpu():
+    if ray.is_initialized():
+        logger.info("Ray is already initialized. Skipping Ray initialization.")
+    elif current_platform.is_rocm() or current_platform.is_xpu():
         # Try to connect existing ray instance and create a new one if not found
         try:
-            ray.init("auto", ignore_reinit_error=True)
+            ray.init("auto")
         except ConnectionError:
             logger.warning(
                 "No existing RAY instance detected. "
                 "A new instance will be launched with current node resources.")
             ray.init(address=ray_address,
-                     ignore_reinit_error=True,
-                     num_gpus=parallel_config.world_size)
+                     num_gpus=parallel_config.world_size,
+                     runtime_env=parallel_config.ray_runtime_env)
     else:
-        ray.init(address=ray_address, ignore_reinit_error=True)
-
-    if parallel_config.placement_group:
-        # Placement group is already set.
-        return
+        ray.init(address=ray_address,
+                 runtime_env=parallel_config.ray_runtime_env)
 
     device_str = current_platform.ray_device_key
     if not device_str:
@@ -285,9 +314,15 @@ def initialize_ray_cluster(
             f"current platform {current_platform.device_name} does not "
             "support ray.")
 
-    # Create placement group for worker processes
-    current_placement_group = ray.util.get_current_placement_group()
+    # Create or get the placement group for worker processes
+    if parallel_config.placement_group:
+        current_placement_group = parallel_config.placement_group
+    else:
+        current_placement_group = ray.util.get_current_placement_group()
+
     if current_placement_group:
+        logger.info("Using the existing placement group")
+
         # We are in a placement group
         bundles = current_placement_group.bundle_specs
         # Verify that we can use the placement group.
@@ -303,10 +338,12 @@ def initialize_ray_cluster(
         if parallel_config.world_size > device_bundles:
             raise ValueError(
                 f"The number of required {device_str}s exceeds the total "
-                f"number of available {device_str}s in the placement group."
+                f"number of available {device_str}s in the placement group. "
                 f"Required number of devices: {parallel_config.world_size}. "
                 f"Total number of devices: {device_bundles}.")
     else:
+        logger.info("No current placement group found. "
+                    "Creating a new placement group.")
         num_devices_in_cluster = ray.cluster_resources().get(device_str, 0)
         # Log a warning message and delay resource allocation failure response.
         # Avoid immediate rejection to allow user-initiated placement group

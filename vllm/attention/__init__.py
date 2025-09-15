@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata,
                                               AttentionMetadataBuilder,
@@ -11,7 +14,6 @@ __all__ = [
     "AttentionMetadata",
     "AttentionType",
     "AttentionMetadataBuilder",
-    "Attention",
     "AttentionState",
     "get_attn_backend",
 ]

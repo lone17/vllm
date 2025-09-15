@@ -1,10 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# ruff: noqa
+
+from tblib import pickling_support
+
+# Install support for pickling exceptions so that we can nicely propagate
+# failures from tests running in a subprocess.
+# This should be run before any custom exception subclasses are defined.
+pickling_support.install()
+
+import http.server
 import json
+import math
+import mimetypes
 import os
+import socket
 import tempfile
-from collections import UserList
+import threading
+from collections.abc import Generator
 from enum import Enum
-from typing import (Any, Callable, Dict, List, Optional, Tuple, Type,
-                    TypedDict, TypeVar, Union)
+from typing import Any, Callable, Optional, TypedDict, TypeVar, Union, cast
 
 import numpy as np
 import pytest
@@ -13,28 +29,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from PIL import Image
-from transformers import (AutoModelForCausalLM, AutoTokenizer, BatchEncoding,
-                          BatchFeature)
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
+                          BatchEncoding, BatchFeature)
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from tests.models.utils import (TokensTextLogprobs,
                                 TokensTextLogprobsPromptLogprobs)
 from vllm import LLM, SamplingParams
+from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
-from vllm.config import TaskOption, TokenizerPoolConfig
+from vllm.config import ConvertOption, RunnerOption, _get_and_verify_dtype
 from vllm.connections import global_http_connection
 from vllm.distributed import (cleanup_dist_env_and_memory,
                               init_distributed_environment,
                               initialize_model_parallel)
 from vllm.inputs import (ExplicitEncoderDecoderPrompt, TextPrompt,
-                         TokensPrompt, to_enc_dec_tuple_list,
-                         zip_enc_dec_prompts)
+                         to_enc_dec_tuple_list, zip_enc_dec_prompts)
 from vllm.logger import init_logger
+from vllm.multimodal.utils import fetch_image
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams
-from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, cuda_device_count_stateless,
-                        identity, is_list_of)
+from vllm.sequence import Logprob
+from vllm.transformers_utils.utils import maybe_model_redirect
 
 logger = init_logger(__name__)
 
@@ -44,29 +61,26 @@ _LONG_PROMPTS = [os.path.join(_TEST_DIR, "prompts", "summary.txt")]
 _SYS_MSG = os.path.join(_TEST_DIR, "system_messages", "sonnet3.5_nov2024.txt")
 
 _M = TypeVar("_M")
-_PromptMultiModalInput = Union[List[_M], List[List[_M]]]
+
+_PromptMultiModalInput = Union[list[_M], list[list[_M]]]
 
 PromptImageInput = _PromptMultiModalInput[Image.Image]
-PromptAudioInput = _PromptMultiModalInput[Tuple[np.ndarray, int]]
+PromptAudioInput = _PromptMultiModalInput[tuple[np.ndarray, int]]
 PromptVideoInput = _PromptMultiModalInput[np.ndarray]
 
 
-def _read_prompts(filename: str) -> List[str]:
+def _read_prompts(filename: str) -> list[str]:
     with open(filename) as f:
         prompts = f.readlines()
         return prompts
 
 
-class _ImageAssetPrompts(TypedDict):
+class ImageAssetPrompts(TypedDict):
     stop_sign: str
     cherry_blossom: str
 
 
-class _ImageAssetsBase(UserList[ImageAsset]):
-    pass
-
-
-class _ImageAssets(_ImageAssetsBase):
+class ImageTestAssets(list[ImageAsset]):
 
     def __init__(self) -> None:
         super().__init__([
@@ -74,7 +88,7 @@ class _ImageAssets(_ImageAssetsBase):
             ImageAsset("cherry_blossom"),
         ])
 
-    def prompts(self, prompts: _ImageAssetPrompts) -> List[str]:
+    def prompts(self, prompts: ImageAssetPrompts) -> list[str]:
         """
         Convenience method to define the prompt for each test image.
 
@@ -84,29 +98,64 @@ class _ImageAssets(_ImageAssetsBase):
         return [prompts["stop_sign"], prompts["cherry_blossom"]]
 
 
-class _VideoAssetPrompts(TypedDict):
-    sample_demo_1: str
+class VideoAssetPrompts(TypedDict):
+    baby_reading: str
 
 
-class _VideoAssetsBase(UserList[VideoAsset]):
-    pass
-
-
-class _VideoAssets(_VideoAssetsBase):
+class VideoTestAssets(list[VideoAsset]):
 
     def __init__(self) -> None:
         super().__init__([
-            VideoAsset("sample_demo_1.mp4"),
+            VideoAsset("baby_reading"),
         ])
 
-    def prompts(self, prompts: _VideoAssetPrompts) -> List[str]:
-        return [prompts["sample_demo_1"]]
+    def prompts(self, prompts: VideoAssetPrompts) -> list[str]:
+        return [prompts["baby_reading"]]
 
 
-IMAGE_ASSETS = _ImageAssets()
-"""Singleton instance of :class:`_ImageAssets`."""
-VIDEO_ASSETS = _VideoAssets()
-"""Singleton instance of :class:`_VideoAssets`."""
+class AudioAssetPrompts(TypedDict):
+    mary_had_lamb: str
+    winning_call: str
+
+
+class AudioTestAssets(list[AudioAsset]):
+
+    def __init__(self) -> None:
+        super().__init__([
+            AudioAsset("mary_had_lamb"),
+            AudioAsset("winning_call"),
+        ])
+
+    def prompts(self, prompts: AudioAssetPrompts) -> list[str]:
+        return [prompts["mary_had_lamb"], prompts["winning_call"]]
+
+
+IMAGE_ASSETS = ImageTestAssets()
+"""Singleton instance of {class}`ImageTestAssets`."""
+VIDEO_ASSETS = VideoTestAssets()
+"""Singleton instance of {class}`VideoTestAssets`."""
+AUDIO_ASSETS = AudioTestAssets()
+"""Singleton instance of {class}`AudioTestAssets`."""
+
+
+@pytest.fixture(scope="function", autouse=True)
+def cleanup_VLLM_USE_V1(monkeypatch):
+    """
+    The V1 oracle sets "VLLM_USE_V1" during loading. This means
+    that each invocation of a test change the env variable.
+
+    If we touch "VLLM_USE_V1" with monkeypatch, then any changes
+    made during the test run by vLLM will be cleaned up.
+
+    This fixture is used by every test.
+    """
+
+    # If VLLM_USE_V1 is not set, set then delete. This will
+    # cause monkeypatch to clean up VLLM_USE_V1 upon exit
+    # if VLLM modifies the value of envs.VLLM_USE_V1.
+    if "VLLM_USE_V1" not in os.environ:
+        monkeypatch.setenv("VLLM_USE_V1", "")
+        monkeypatch.delenv("VLLM_USE_V1")
 
 
 @pytest.fixture(params=[True, False])
@@ -114,6 +163,7 @@ def run_with_both_engines(request, monkeypatch):
     # Automatically runs tests twice, once with V1 and once without
     use_v1 = request.param
     # Tests decorated with `@skip_v1` are only run without v1
+    skip_v0 = request.node.get_closest_marker("skip_v0")
     skip_v1 = request.node.get_closest_marker("skip_v1")
 
     if use_v1:
@@ -121,6 +171,8 @@ def run_with_both_engines(request, monkeypatch):
             pytest.skip("Skipping test on vllm V1")
         monkeypatch.setenv('VLLM_USE_V1', '1')
     else:
+        if skip_v0:
+            pytest.skip("Skipping test on vllm V0")
         monkeypatch.setenv('VLLM_USE_V1', '0')
 
     yield
@@ -172,7 +224,7 @@ def dynamo_reset():
 
 
 @pytest.fixture
-def example_prompts() -> List[str]:
+def example_prompts() -> list[str]:
     prompts = []
     for filename in _TEST_PROMPTS:
         prompts += _read_prompts(filename)
@@ -194,7 +246,7 @@ class DecoderPromptType(Enum):
 
 @pytest.fixture
 def example_encoder_decoder_prompts(
-) -> Dict[DecoderPromptType, List[ExplicitEncoderDecoderPrompt]]:
+) -> dict[DecoderPromptType, list[ExplicitEncoderDecoderPrompt]]:
     '''
     Returns an encoder prompt list and a decoder prompt list, wherein each pair
     of same-index entries in both lists corresponds to an (encoder prompt,
@@ -226,7 +278,7 @@ def example_encoder_decoder_prompts(
 
 
 @pytest.fixture
-def example_long_prompts() -> List[str]:
+def example_long_prompts() -> list[str]:
     prompts = []
     for filename in _LONG_PROMPTS:
         prompts += _read_prompts(filename)
@@ -234,13 +286,18 @@ def example_long_prompts() -> List[str]:
 
 
 @pytest.fixture(scope="session")
-def image_assets() -> _ImageAssets:
+def image_assets() -> ImageTestAssets:
     return IMAGE_ASSETS
 
 
 @pytest.fixture(scope="session")
-def video_assets() -> _VideoAssets:
+def video_assets() -> VideoTestAssets:
     return VIDEO_ASSETS
+
+
+@pytest.fixture(scope="session")
+def audio_assets() -> AudioTestAssets:
+    return AUDIO_ASSETS
 
 
 _T = TypeVar("_T", nn.Module, torch.Tensor, BatchEncoding, BatchFeature, dict)
@@ -249,13 +306,18 @@ _R = TypeVar("_R")
 
 class HfRunner:
 
-    def wrap_device(self, x: _T, device: Optional[str] = None) -> _T:
+    def get_default_device(self):
         from vllm.platforms import current_platform
+
+        return ("cpu"
+                if current_platform.is_cpu() else current_platform.device_type)
+
+    def wrap_device(self, x: _T, device: Optional[str] = None) -> _T:
         if x is None or isinstance(x, (bool, )):
             return x
 
         if device is None:
-            device = "cpu" if current_platform.is_cpu() else "cuda"
+            device = self.device
 
         if isinstance(x, dict):
             return {k: self.wrap_device(v, device) for k, v in x.items()}
@@ -268,51 +330,78 @@ class HfRunner:
     def __init__(
         self,
         model_name: str,
-        dtype: str = "half",
+        dtype: str = "auto",
         *,
-        model_kwargs: Optional[Dict[str, Any]] = None,
+        model_kwargs: Optional[dict[str, Any]] = None,
+        trust_remote_code: bool = True,
         is_sentence_transformer: bool = False,
         is_cross_encoder: bool = False,
         skip_tokenizer_init: bool = False,
-        auto_cls: Type[_BaseAutoModelClass] = AutoModelForCausalLM,
-        postprocess_inputs: Callable[..., BatchEncoding] = identity,
+        auto_cls: type[_BaseAutoModelClass] = AutoModelForCausalLM,
     ) -> None:
-        torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[dtype]
-
+        model_name = maybe_model_redirect(model_name)
         self.model_name = model_name
+
+        self.config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+        )
+        self.device = self.get_default_device()
+        self.dtype = torch_dtype = _get_and_verify_dtype(
+            self.model_name,
+            self.config,
+            dtype=dtype,
+            is_pooling_model=is_sentence_transformer or is_cross_encoder,
+        )
+
+        model_kwargs = model_kwargs if model_kwargs is not None else {}
+        model_kwargs.setdefault("torch_dtype", torch_dtype)
 
         if is_sentence_transformer:
             # Lazy init required for AMD CI
             from sentence_transformers import SentenceTransformer
-            self.model = self.wrap_device(
-                SentenceTransformer(
-                    model_name,
-                    device="cpu",
-                    trust_remote_code=True,
-                ).to(dtype=torch_dtype))
+
+            self.model = SentenceTransformer(
+                model_name,
+                device=self.device,
+                model_kwargs=model_kwargs,
+                trust_remote_code=trust_remote_code,
+            )
         elif is_cross_encoder:
             # Lazy init required for AMD CI
             from sentence_transformers import CrossEncoder
-            self.model = CrossEncoder(model_name,
-                                      device="cpu",
-                                      trust_remote_code=True)
-            self.model.model = self.wrap_device(self.model.model)\
-                .to(dtype=torch_dtype)
+
+            self.model = CrossEncoder(
+                model_name,
+                device=self.device,
+                automodel_args=model_kwargs,
+                trust_remote_code=trust_remote_code,
+            )
         else:
-            model_kwargs = model_kwargs if model_kwargs is not None else {}
-            self.model = self.wrap_device(
-                auto_cls.from_pretrained(
-                    model_name,
-                    torch_dtype=torch_dtype,
-                    trust_remote_code=True,
-                    **model_kwargs,
-                ))
+            model = auto_cls.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+                **model_kwargs,
+            )
+
+            # in case some unquantized custom models are not in same dtype
+            if (getattr(model, "quantization_method", None) is None
+                    and any(p.dtype != self.dtype
+                            for p in model.parameters())):
+                model = model.to(dtype=self.dtype)
+
+            if (getattr(model, "quantization_method", None) != "bitsandbytes"
+                    and len({p.device
+                             for p in model.parameters()}) < 2):
+                model = model.to(device=self.device)
+
+            self.model = model
 
         if not skip_tokenizer_init:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name,
                 torch_dtype=torch_dtype,
-                trust_remote_code=True,
+                trust_remote_code=trust_remote_code,
             )
 
         # don't put this import at the top level
@@ -321,21 +410,18 @@ class HfRunner:
         self.processor = AutoProcessor.from_pretrained(
             model_name,
             torch_dtype=torch_dtype,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
         )
         if skip_tokenizer_init:
             self.tokenizer = self.processor.tokenizer
 
-        self.dtype = dtype
-        self.postprocess_inputs = postprocess_inputs
-
     def get_inputs(
         self,
-        prompts: List[str],
+        prompts: list[str],
         images: Optional[PromptImageInput] = None,
         videos: Optional[PromptVideoInput] = None,
         audios: Optional[PromptAudioInput] = None,
-    ) -> List[BatchEncoding]:
+    ) -> list[Union[BatchFeature, BatchEncoding]]:
         if images is not None:
             assert len(prompts) == len(images)
 
@@ -345,9 +431,9 @@ class HfRunner:
         if audios is not None:
             assert len(prompts) == len(audios)
 
-        all_inputs: List[BatchEncoding] = []
+        all_inputs: list[Union[BatchFeature, BatchEncoding]] = []
         for i, prompt in enumerate(prompts):
-            processor_kwargs: Dict[str, Any] = {
+            processor_kwargs: dict[str, Any] = {
                 "text": prompt,
                 "return_tensors": "pt",
             }
@@ -355,46 +441,68 @@ class HfRunner:
                 processor_kwargs["images"] = image
             if videos is not None and (video := videos[i]) is not None:
                 processor_kwargs["videos"] = video
-            if audios is not None and (audio_tuple := audios[i]) is not None:
-                audio, sr = audio_tuple
-                processor_kwargs["audio"] = audio
-                processor_kwargs["sampling_rate"] = sr
+            if audios is not None and (audio_inputs := audios[i]) is not None:
+                # HACK - not all processors take sampling_rate; we should
+                # clean this up in the future.
+                if len(audio_inputs) == 2:
+                    audio, sr = audio_inputs
+                    processor_kwargs["audio"] = audio
+                    processor_kwargs["sampling_rate"] = sr
+                else:
+                    processor_kwargs["audio"] = audio_inputs
 
             inputs = self.processor(**processor_kwargs)
-            inputs = self.postprocess_inputs(inputs, dtype=self.dtype)
+            if isinstance(inputs, BatchFeature):
+                inputs = inputs.to(dtype=self.dtype)
 
             all_inputs.append(inputs)
 
         return all_inputs
 
-    def classify(self, prompts: List[str]) -> List[str]:
+    def get_prompt_embeddings(self, prompts: list[str]) -> list[torch.Tensor]:
+        all_inputs = self.get_inputs(prompts)
+        embeddings = []
+        for inputs in all_inputs:
+            input_ids = self.wrap_device(inputs)["input_ids"]
+            embedding = self.model.get_input_embeddings()(input_ids).squeeze(0)
+            embeddings.append(embedding)
+        return embeddings
+
+    def classify(self, prompts: list[str]) -> list[str]:
         # output is final logits
         all_inputs = self.get_inputs(prompts)
         outputs = []
+        problem_type = getattr(self.config, "problem_type", "")
+
         for inputs in all_inputs:
             output = self.model(**self.wrap_device(inputs))
-            logits = output.logits.softmax(dim=-1)[0].tolist()
+            if problem_type == "regression":
+                logits = output.logits[0].tolist()
+            elif problem_type == "multi_label_classification":
+                logits = output.logits.sigmoid()[0].tolist()
+            else:
+                logits = output.logits.softmax(dim=-1)[0].tolist()
             outputs.append(logits)
 
         return outputs
 
     def generate(
         self,
-        prompts: List[str],
+        prompts: list[str],
         images: Optional[PromptImageInput] = None,
         videos: Optional[PromptVideoInput] = None,
         audios: Optional[PromptAudioInput] = None,
         **kwargs: Any,
-    ) -> List[Tuple[List[List[int]], List[str]]]:
+    ) -> list[tuple[list[list[int]], list[str]]]:
         all_inputs = self.get_inputs(prompts,
                                      images=images,
                                      videos=videos,
                                      audios=audios)
 
-        outputs: List[Tuple[List[List[int]], List[str]]] = []
+        outputs: list[tuple[list[list[int]], list[str]]] = []
         for inputs in all_inputs:
             output_ids = self.model.generate(
-                **self.wrap_device(inputs, device=self.model.device.type),
+                **self.wrap_device(inputs),
                 use_cache=True,
                 **kwargs,
             )
@@ -409,13 +517,13 @@ class HfRunner:
 
     def generate_greedy(
         self,
-        prompts: List[str],
+        prompts: list[str],
         max_tokens: int,
         images: Optional[PromptImageInput] = None,
         videos: Optional[PromptVideoInput] = None,
         audios: Optional[PromptAudioInput] = None,
         **kwargs: Any,
-    ) -> List[Tuple[List[int], str]]:
+    ) -> list[tuple[list[int], str]]:
         outputs = self.generate(prompts,
                                 do_sample=False,
                                 max_new_tokens=max_tokens,
@@ -429,15 +537,22 @@ class HfRunner:
 
     def generate_beam_search(
         self,
-        prompts: List[str],
+        prompts: list[str],
         beam_width: int,
         max_tokens: int,
-    ) -> List[Tuple[List[List[int]], List[str]]]:
+        images: Optional[PromptImageInput] = None,
+        videos: Optional[PromptVideoInput] = None,
+        audios: Optional[PromptAudioInput] = None,
+    ) -> list[tuple[list[list[int]], list[str]]]:
         outputs = self.generate(prompts,
                                 do_sample=False,
                                 max_new_tokens=max_tokens,
                                 num_beams=beam_width,
-                                num_return_sequences=beam_width)
+                                num_return_sequences=beam_width,
+                                images=images,
+                                videos=videos,
+                                audios=audios)
+
         for i in range(len(outputs)):
             output_ids, output_str = outputs[i]
             for j in range(len(output_ids)):
@@ -450,22 +565,22 @@ class HfRunner:
 
     def generate_greedy_logprobs(
         self,
-        prompts: List[str],
+        prompts: list[str],
         max_tokens: int,
         images: Optional[PromptImageInput] = None,
         videos: Optional[PromptVideoInput] = None,
         audios: Optional[PromptAudioInput] = None,
         **kwargs: Any,
-    ) -> List[List[torch.Tensor]]:
+    ) -> list[list[torch.Tensor]]:
         all_inputs = self.get_inputs(prompts,
                                      images=images,
                                      videos=videos,
                                      audios=audios)
 
-        all_logprobs: List[List[torch.Tensor]] = []
+        all_logprobs: list[list[torch.Tensor]] = []
         for inputs in all_inputs:
             output = self.model.generate(
-                **self.wrap_device(inputs, device=self.model.device.type),
+                **self.wrap_device(inputs),
                 use_cache=True,
                 do_sample=False,
                 max_new_tokens=max_tokens,
@@ -480,15 +595,18 @@ class HfRunner:
 
     def _hidden_states_to_seq_logprobs(
         self,
-        hidden_states: Tuple[Tuple[torch.Tensor, ...], ...],
-    ) -> List[torch.Tensor]:
+        hidden_states: tuple[tuple[torch.Tensor, ...], ...],
+    ) -> list[torch.Tensor]:
         output_embeddings = self.model.get_output_embeddings()
 
-        seq_logprobs: List[torch.Tensor] = []
+        seq_logprobs: list[torch.Tensor] = []
         for _, hidden_state in enumerate(hidden_states):
             last_hidden_states = hidden_state[-1][0]
             logits = torch.matmul(
-                last_hidden_states.to(output_embeddings.weight.device),
+                last_hidden_states.to(
+                    device=output_embeddings.weight.device,
+                    dtype=output_embeddings.weight.dtype,
+                ),
                 output_embeddings.weight.t(),
             )
             if getattr(output_embeddings, "bias", None) is not None:
@@ -500,14 +618,14 @@ class HfRunner:
 
     def _hidden_states_to_logprobs(
         self,
-        hidden_states: Tuple[Tuple[torch.Tensor, ...], ...],
-        num_logprobs: int,
-    ) -> Tuple[List[Dict[int, float]], int]:
+        hidden_states: tuple[tuple[torch.Tensor, ...], ...],
+        num_logprobs: Optional[int],
+    ) -> tuple[list[dict[int, float]], int]:
         seq_logprobs = self._hidden_states_to_seq_logprobs(hidden_states)
         output_len = len(hidden_states)
 
         # convert to dict
-        seq_logprobs_lst: List[Dict[int, float]] = []
+        seq_logprobs_lst: list[dict[int, float]] = []
         for tok_idx, tok_logprobs in enumerate(seq_logprobs):
             # drop prompt logprobs
             if tok_idx == 0:
@@ -527,26 +645,26 @@ class HfRunner:
 
     def generate_greedy_logprobs_limit(
         self,
-        prompts: List[str],
+        prompts: list[str],
         max_tokens: int,
-        num_logprobs: int,
+        num_logprobs: Optional[int],
         images: Optional[PromptImageInput] = None,
         audios: Optional[PromptAudioInput] = None,
         videos: Optional[PromptVideoInput] = None,
         **kwargs: Any,
-    ) -> List[TokensTextLogprobs]:
+    ) -> list[TokensTextLogprobs]:
         all_inputs = self.get_inputs(prompts,
                                      images=images,
                                      videos=videos,
                                      audios=audios)
 
-        all_logprobs: List[List[Dict[int, float]]] = []
-        all_output_ids: List[List[int]] = []
-        all_output_strs: List[str] = []
+        all_logprobs: list[list[dict[int, float]]] = []
+        all_output_ids: list[list[int]] = []
+        all_output_strs: list[str] = []
 
         for inputs in all_inputs:
             output = self.model.generate(
-                **self.wrap_device(inputs, device=self.model.device.type),
+                **self.wrap_device(inputs),
                 use_cache=True,
                 do_sample=False,
                 max_new_tokens=max_tokens,
@@ -574,51 +692,47 @@ class HfRunner:
 
     def generate_encoder_decoder_greedy_logprobs_limit(
         self,
-        encoder_decoder_prompts: List[ExplicitEncoderDecoderPrompt[str, str]],
+        encoder_decoder_prompts: list[ExplicitEncoderDecoderPrompt[str, str]],
         max_tokens: int,
-        num_logprobs: int,
+        num_logprobs: Optional[int],
         images: Optional[PromptImageInput] = None,
         **kwargs: Any,
-    ) -> List[TokensTextLogprobs]:
+    ) -> list[TokensTextLogprobs]:
         '''
         Greedy logprobs generation for vLLM encoder/decoder models
         '''
 
-        all_logprobs: List[List[Dict[int, float]]] = []
-        all_output_ids: List[List[int]] = []
-        all_output_strs: List[str] = []
+        all_logprobs: list[list[dict[int, float]]] = []
+        all_output_ids: list[list[int]] = []
+        all_output_strs: list[str] = []
 
         for i, (encoder_prompt, decoder_prompt) in enumerate(
                 to_enc_dec_tuple_list(encoder_decoder_prompts)):
-            processor_kwargs: Dict[str, Any] = {
+            processor_kwargs: dict[str, Any] = {
                 "text": encoder_prompt,
                 "return_tensors": "pt",
             }
             if images is not None and images[i] is not None:
                 processor_kwargs["images"] = images[i]
 
-            encoder_input_ids = self.wrap_device(
-                self.processor(**processor_kwargs).input_ids,
-                device=self.model.device.type,
-            )
+            encoder_inputs = self.processor(**processor_kwargs)
+            encoder_inputs = self.wrap_device(encoder_inputs)
 
             if decoder_prompt is None:
                 decoder_input_ids = None
             else:
-                decoder_input_ids = self.wrap_device(
-                    self.tokenizer(decoder_prompt,
-                                   return_tensors="pt").input_ids,
-                    device=self.model.device.type,
-                )
+                decoder_inputs = self.tokenizer(decoder_prompt,
+                                                return_tensors="pt")
+                decoder_input_ids = self.wrap_device(decoder_inputs.input_ids)
 
             output = self.model.generate(
-                encoder_input_ids,
                 decoder_input_ids=decoder_input_ids,
                 use_cache=True,
                 do_sample=False,
                 max_new_tokens=max_tokens,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
+                **encoder_inputs,
                 **kwargs,
             )
 
@@ -638,11 +752,16 @@ class HfRunner:
         return [(output_ids, output_str, output_logprobs)
                 for output_ids, output_str, output_logprobs in outputs]
 
-    def encode(self, prompts: List[str]) -> List[List[torch.Tensor]]:
-        return self.model.encode(prompts)
+    def encode(self, prompts: list[str], *args,
+               **kwargs) -> list[list[torch.Tensor]]:
+        return self.model.encode(prompts, *args, **kwargs)
 
-    def predict(self, prompts: List[List[str]]) -> torch.Tensor:
-        return self.model.predict(prompts, convert_to_tensor=True)
+    def predict(self, prompts: list[list[str]], *args,
+                **kwargs) -> torch.Tensor:
+        return self.model.predict(prompts,
+                                  *args,
+                                  convert_to_tensor=True,
+                                  **kwargs)
 
     def __enter__(self):
         return self
@@ -658,32 +777,48 @@ def hf_runner():
 
 
 class VllmRunner:
+    """
+    The default value of some arguments have been modified from
+    {class}`~vllm.LLM` as follows:
+
+    - `trust_remote_code`: Set to `True` instead of `False` for convenience.
+    - `seed`: Set to `0` instead of `None` for test reproducibility.
+    - `max_model_len`: Set to `1024` instead of `None` to reduce memory usage.
+    - `block_size`: To reduce memory usage, set default to `64` if on XPU
+        devices, otherwise default to `16`.
+    - `enable_chunked_prefill`: Set to `False` instead of `None` for
+      test reproducibility.
+    - `enforce_eager`: Set to `False` to test CUDA graph.
+    """
 
     def __init__(
         self,
         model_name: str,
-        task: TaskOption = "auto",
+        runner: RunnerOption = "auto",
+        convert: ConvertOption = "auto",
         tokenizer_name: Optional[str] = None,
         tokenizer_mode: str = "auto",
-        # Use smaller max model length, otherwise bigger model cannot run due
-        # to kv cache size limit.
-        max_model_len: int = 1024,
-        dtype: str = "half",
+        trust_remote_code: bool = True,
+        seed: Optional[int] = 0,
+        max_model_len: Optional[int] = 1024,
+        dtype: str = "auto",
         disable_log_stats: bool = True,
         tensor_parallel_size: int = 1,
-        block_size: int = 16,
-        enable_chunked_prefill: bool = False,
+        block_size: int = 16 if not torch.xpu.is_available() else 64,
+        enable_chunked_prefill: Optional[bool] = False,
         swap_space: int = 4,
         enforce_eager: Optional[bool] = False,
         **kwargs,
     ) -> None:
-        self.model = LLM(
+        self.llm = LLM(
             model=model_name,
-            task=task,
+            runner=runner,
+            convert=convert,
             tokenizer=tokenizer_name,
             tokenizer_mode=tokenizer_mode,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             dtype=dtype,
+            seed=seed,
             swap_space=swap_space,
             enforce_eager=enforce_eager,
             disable_log_stats=disable_log_stats,
@@ -696,73 +831,79 @@ class VllmRunner:
 
     def get_inputs(
         self,
-        prompts: List[str],
+        prompts: Union[list[str], list[torch.Tensor], list[int]],
         images: Optional[PromptImageInput] = None,
         videos: Optional[PromptVideoInput] = None,
         audios: Optional[PromptAudioInput] = None,
-    ) -> List[TextPrompt]:
-        if images is not None:
-            assert len(prompts) == len(images)
+    ) -> list[TextPrompt]:
 
-        if videos is not None:
-            assert len(prompts) == len(videos)
+        if any(x is not None and len(x) != len(prompts)
+               for x in [images, videos, audios]):
+            raise ValueError(
+                "All non-None multimodal inputs must have the same length as "
+                "prompts")
 
-        if audios is not None:
-            assert len(prompts) == len(audios)
+        inputs = []
+        for i, prompt in enumerate(prompts):
+            multi_modal_data = {}
+            if images is not None and (image := images[i]) is not None:
+                multi_modal_data["image"] = image
+            if videos is not None and (video := videos[i]) is not None:
+                multi_modal_data["video"] = video
+            if audios is not None and (audio := audios[i]) is not None:
+                multi_modal_data["audio"] = audio
 
-        inputs = [TextPrompt(prompt=prompt) for prompt in prompts]
-        if images is not None:
-            for i, image in enumerate(images):
-                if image is not None:
-                    inputs[i]["multi_modal_data"] = {"image": image}
+            text_prompt_kwargs: dict[str, Any] = {
+                "multi_modal_data": multi_modal_data or None
+            }
+            if isinstance(prompt, str):
+                text_prompt_kwargs["prompt"] = prompt
+            elif isinstance(prompt, list):
+                text_prompt_kwargs["prompt_token_ids"] = prompt
+            else:
+                text_prompt_kwargs["prompt_embeds"] = prompt
 
-        if videos is not None:
-            for i, video in enumerate(videos):
-                if video is not None:
-                    inputs[i]["multi_modal_data"] = {"video": video}
-
-        if audios is not None:
-            for i, audio in enumerate(audios):
-                if audio is not None:
-                    inputs[i]["multi_modal_data"] = {"audio": audio}
+            inputs.append(TextPrompt(**text_prompt_kwargs))
 
         return inputs
 
     def generate(
         self,
-        prompts: List[str],
+        prompts: Union[list[str], list[torch.Tensor]],
         sampling_params: SamplingParams,
         images: Optional[PromptImageInput] = None,
         videos: Optional[PromptVideoInput] = None,
         audios: Optional[PromptAudioInput] = None,
-    ) -> List[Tuple[List[List[int]], List[str]]]:
+        **kwargs: Any,
+    ) -> list[tuple[list[list[int]], list[str]]]:
         inputs = self.get_inputs(prompts,
                                  images=images,
                                  videos=videos,
                                  audios=audios)
 
-        req_outputs = self.model.generate(inputs,
-                                          sampling_params=sampling_params)
+        req_outputs = self.llm.generate(inputs,
+                                        sampling_params=sampling_params,
+                                        **kwargs)
 
-        outputs: List[Tuple[List[List[int]], List[str]]] = []
+        outputs: list[tuple[list[list[int]], list[str]]] = []
         for req_output in req_outputs:
             prompt_str = req_output.prompt
             prompt_ids = req_output.prompt_token_ids
-            req_sample_output_ids: List[List[int]] = []
-            req_sample_output_strs: List[str] = []
+            req_sample_output_ids: list[list[int]] = []
+            req_sample_output_strs: list[str] = []
             for sample in req_output.outputs:
                 output_str = sample.text
                 output_ids = list(sample.token_ids)
                 req_sample_output_ids.append(prompt_ids + output_ids)
-                req_sample_output_strs.append(prompt_str + output_str)
+                req_sample_output_strs.append((prompt_str or "") + output_str)
             outputs.append((req_sample_output_ids, req_sample_output_strs))
         return outputs
 
     @staticmethod
     def _final_steps_generate_w_logprobs(
-        req_outputs: List[RequestOutput],
-    ) -> List[TokensTextLogprobsPromptLogprobs]:
-        outputs: List[TokensTextLogprobsPromptLogprobs] = []
+        req_outputs: list[RequestOutput],
+    ) -> list[TokensTextLogprobsPromptLogprobs]:
+        outputs: list[TokensTextLogprobsPromptLogprobs] = []
         for req_output in req_outputs:
             assert len(req_output.outputs) > 0
             for sample in req_output.outputs:
@@ -775,20 +916,22 @@ class VllmRunner:
 
     def generate_w_logprobs(
         self,
-        prompts: List[str],
+        prompts: list[str],
         sampling_params: SamplingParams,
         images: Optional[PromptImageInput] = None,
         audios: Optional[PromptAudioInput] = None,
         videos: Optional[PromptVideoInput] = None,
-    ) -> Union[List[TokensTextLogprobs],
-               List[TokensTextLogprobsPromptLogprobs]]:
+        **kwargs: Any,
+    ) -> Union[list[TokensTextLogprobs],
+               list[TokensTextLogprobsPromptLogprobs]]:
         inputs = self.get_inputs(prompts,
                                  images=images,
                                  videos=videos,
                                  audios=audios)
 
-        req_outputs = self.model.generate(inputs,
-                                          sampling_params=sampling_params)
+        req_outputs = self.llm.generate(inputs,
+                                        sampling_params=sampling_params,
+                                        **kwargs)
 
         toks_str_logsprobs_prompt_logprobs = (
             self._final_steps_generate_w_logprobs(req_outputs))
@@ -799,17 +942,17 @@ class VllmRunner:
 
     def generate_encoder_decoder_w_logprobs(
         self,
-        encoder_decoder_prompts: List[ExplicitEncoderDecoderPrompt[str, str]],
+        encoder_decoder_prompts: list[ExplicitEncoderDecoderPrompt[str, str]],
         sampling_params: SamplingParams,
-    ) -> Union[List[TokensTextLogprobs],
-               List[TokensTextLogprobsPromptLogprobs]]:
+    ) -> Union[list[TokensTextLogprobs],
+               list[TokensTextLogprobsPromptLogprobs]]:
         '''
         Logprobs generation for vLLM encoder/decoder models
         '''
 
         assert sampling_params.logprobs is not None
-        req_outputs = self.model.generate(encoder_decoder_prompts,
-                                          sampling_params=sampling_params)
+        req_outputs = self.llm.generate(encoder_decoder_prompts,
+                                        sampling_params=sampling_params)
         toks_str_logsprobs_prompt_logprobs = (
             self._final_steps_generate_w_logprobs(req_outputs))
         # Omit prompt logprobs if not required by sampling params
@@ -819,34 +962,37 @@ class VllmRunner:
 
     def generate_greedy(
         self,
-        prompts: List[str],
+        prompts: Union[list[str], list[torch.Tensor]],
         max_tokens: int,
         images: Optional[PromptImageInput] = None,
         videos: Optional[PromptVideoInput] = None,
         audios: Optional[PromptAudioInput] = None,
-    ) -> List[Tuple[List[int], str]]:
+        **kwargs: Any,
+    ) -> list[tuple[list[int], str]]:
         greedy_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
         outputs = self.generate(prompts,
                                 greedy_params,
                                 images=images,
                                 videos=videos,
-                                audios=audios)
+                                audios=audios,
+                                **kwargs)
         return [(output_ids[0], output_str[0])
                 for output_ids, output_str in outputs]
 
     def generate_greedy_logprobs(
         self,
-        prompts: List[str],
+        prompts: list[str],
         max_tokens: int,
-        num_logprobs: int,
+        num_logprobs: Optional[int],
         num_prompt_logprobs: Optional[int] = None,
         images: Optional[PromptImageInput] = None,
         audios: Optional[PromptAudioInput] = None,
         videos: Optional[PromptVideoInput] = None,
-        stop_token_ids: Optional[List[int]] = None,
-        stop: Optional[List[str]] = None,
-    ) -> Union[List[TokensTextLogprobs],
-               List[TokensTextLogprobsPromptLogprobs]]:
+        stop_token_ids: Optional[list[int]] = None,
+        stop: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> Union[list[TokensTextLogprobs],
+               list[TokensTextLogprobsPromptLogprobs]]:
         greedy_logprobs_params = SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
@@ -859,21 +1005,53 @@ class VllmRunner:
                                         greedy_logprobs_params,
                                         images=images,
                                         audios=audios,
-                                        videos=videos)
+                                        videos=videos,
+                                        **kwargs)
+
+    def generate_prompt_perplexity(self, prompts: list[str]) -> list[float]:
+        """
+        Return the perplexity score associated with generating the prompts
+
+        :param prompts: list of prompts to score
+        :return: perplexity score of each prompt
+        """
+        outputs = self.generate_greedy_logprobs(prompts,
+                                                max_tokens=1,
+                                                num_logprobs=None,
+                                                num_prompt_logprobs=0)
+
+        perplexities = []
+        for output in outputs:
+            output = cast(TokensTextLogprobsPromptLogprobs, output)
+            token_datas = cast(list[Optional[dict[int, Logprob]]], output[3])
+            assert token_datas[0] is None
+            token_log_probs = []
+            for token_data in token_datas[1:]:
+                assert token_data is not None
+                assert len(token_data) == 1
+                token_log_prob = list(token_data.values())[0].logprob
+                token_log_probs.append(token_log_prob)
+
+            perplexity = math.exp(-sum(token_log_probs) / len(token_log_probs))
+            perplexities.append(perplexity)
+
+        return perplexities
 
     def generate_encoder_decoder_greedy_logprobs(
         self,
-        encoder_decoder_prompts: List[ExplicitEncoderDecoderPrompt[str, str]],
+        encoder_decoder_prompts: list[ExplicitEncoderDecoderPrompt[str, str]],
         max_tokens: int,
-        num_logprobs: int,
+        num_logprobs: Optional[int],
         num_prompt_logprobs: Optional[int] = None,
-    ) -> Union[List[TokensTextLogprobs],
-               List[TokensTextLogprobsPromptLogprobs]]:
+        skip_special_tokens: bool = True,
+    ) -> Union[list[TokensTextLogprobs],
+               list[TokensTextLogprobsPromptLogprobs]]:
         greedy_logprobs_params = SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
             logprobs=num_logprobs,
             prompt_logprobs=(num_prompt_logprobs),
+            skip_special_tokens=skip_special_tokens,
         )
         '''
         Greedy logprobs generation for vLLM encoder/decoder models
@@ -884,19 +1062,23 @@ class VllmRunner:
 
     def generate_beam_search(
         self,
-        prompts: Union[List[str], List[List[int]]],
+        prompts: list[str],
         beam_width: int,
         max_tokens: int,
-    ) -> List[Tuple[List[List[int]], List[str]]]:
-        if is_list_of(prompts, str, check="all"):
-            prompts = [TextPrompt(prompt=prompt) for prompt in prompts]
-        else:
-            prompts = [
-                TokensPrompt(prompt_token_ids=tokens) for tokens in prompts
-            ]
-        outputs = self.model.beam_search(
-            prompts,
-            BeamSearchParams(beam_width=beam_width, max_tokens=max_tokens))
+        images: Optional[PromptImageInput] = None,
+        videos: Optional[PromptVideoInput] = None,
+        audios: Optional[PromptAudioInput] = None,
+        concurrency_limit: Optional[int] = None,
+    ) -> list[tuple[list[list[int]], list[str]]]:
+        inputs = self.get_inputs(prompts,
+                                 images=images,
+                                 videos=videos,
+                                 audios=audios)
+
+        outputs = self.llm.beam_search(inputs,
+                                       BeamSearchParams(beam_width=beam_width,
+                                                        max_tokens=max_tokens),
+                                       concurrency_limit=concurrency_limit)
         returned_outputs = []
         for output in outputs:
             token_ids = [x.tokens for x in output.sequences]
@@ -904,62 +1086,70 @@ class VllmRunner:
             returned_outputs.append((token_ids, texts))
         return returned_outputs
 
-    def classify(self, prompts: List[str]) -> List[List[float]]:
-        req_outputs = self.model.classify(prompts)
+    def classify(self, prompts: list[str]) -> list[list[float]]:
+        req_outputs = self.llm.classify(prompts)
         return [req_output.outputs.probs for req_output in req_outputs]
 
-    def encode(
-        self,
-        prompts: List[str],
-        images: Optional[PromptImageInput] = None,
-        videos: Optional[PromptVideoInput] = None,
-        audios: Optional[PromptAudioInput] = None,
-    ) -> List[List[float]]:
+    def embed(self,
+              prompts: list[str],
+              images: Optional[PromptImageInput] = None,
+              videos: Optional[PromptVideoInput] = None,
+              audios: Optional[PromptAudioInput] = None,
+              *args,
+              **kwargs) -> list[list[float]]:
         inputs = self.get_inputs(prompts,
                                  images=images,
                                  videos=videos,
                                  audios=audios)
 
-        req_outputs = self.model.embed(inputs)
+        req_outputs = self.llm.embed(inputs, *args, **kwargs)
         return [req_output.outputs.embedding for req_output in req_outputs]
+
+    def encode(self, prompts: list[str]) -> list[list[float]]:
+        req_outputs = self.llm.encode(prompts)
+        return [req_output.outputs.data for req_output in req_outputs]
+
+    def reward(self, prompts: list[str]) -> list[list[float]]:
+        req_outputs = self.llm.reward(prompts)
+        return [req_output.outputs.data for req_output in req_outputs]
 
     def score(
         self,
-        text_1: Union[str, List[str]],
-        text_2: Union[str, List[str]],
-    ) -> List[float]:
-        req_outputs = self.model.score(text_1, text_2)
+        text_1: Union[str, list[str]],
+        text_2: Union[str, list[str]],
+        *args,
+        **kwargs,
+    ) -> list[float]:
+        req_outputs = self.llm.score(text_1, text_2, *args, **kwargs)
         return [req_output.outputs.score for req_output in req_outputs]
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
-        executor = self.model.llm_engine.model_executor
-        return executor.apply_model(func)
+        if hasattr(self.llm.llm_engine, "model_executor"):
+            # This works either in V0 or in V1 with
+            # VLLM_ENABLE_V1_MULTIPROCESSING=0
+            executor = self.llm.llm_engine.model_executor
+            return executor.apply_model(func)
+
+        # This works in V1 with VLLM_ALLOW_INSECURE_SERIALIZATION=1
+        def _apply_model(self):
+            return func(self.get_model())
+
+        return self.llm.llm_engine.collective_rpc(_apply_model)
+
+    def get_llm(self) -> LLM:
+        return self.llm
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        del self.model
+        del self.llm
         cleanup_dist_env_and_memory()
 
 
 @pytest.fixture(scope="session")
 def vllm_runner():
     return VllmRunner
-
-
-def get_tokenizer_pool_config(tokenizer_group_type):
-    if tokenizer_group_type is None:
-        return None
-    if tokenizer_group_type == "ray":
-        return TokenizerPoolConfig(pool_size=1,
-                                   pool_type="ray",
-                                   extra_config={})
-    if isinstance(tokenizer_group_type, type):
-        return TokenizerPoolConfig(pool_size=1,
-                                   pool_type=tokenizer_group_type,
-                                   extra_config={})
-    raise ValueError(f"Unknown tokenizer_group_type: {tokenizer_group_type}")
 
 
 @pytest.fixture()
@@ -983,7 +1173,8 @@ def num_gpus_available():
     """Get number of GPUs without initializing the CUDA context
     in current process."""
 
-    return cuda_device_count_stateless()
+    from vllm.platforms import current_platform
+    return current_platform.device_count()
 
 
 temp_dir = tempfile.gettempdir()
@@ -1066,3 +1257,131 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "optional" in item.keywords:
             item.add_marker(skip_optional)
+
+
+@pytest.fixture(scope="session")
+def cli_config_file():
+    """Return the path to the CLI config file."""
+    return os.path.join(_TEST_DIR, "config", "test_config.yaml")
+
+
+@pytest.fixture(scope="session")
+def cli_config_file_with_model():
+    """Return the path to the CLI config file with model."""
+    return os.path.join(_TEST_DIR, "config", "test_config_with_model.yaml")
+
+
+class AssetHandler(http.server.BaseHTTPRequestHandler):
+    # _IMAGE_CACHE : Dict[str, bytes] = {}
+
+    def log_message(self, *args, **kwargs):
+        pass
+
+    def do_GET(self):
+        # Accepts paths like: /1280px-Venn_diagram_rgb.jpg
+        filename = self.path.lstrip("/")
+        if not filename or "." not in filename:
+            self.send_error(404, "Missing filename (expected /<name>.<ext>)")
+            return
+
+        base, ext = filename.rsplit(".", 1)
+        ext = ext.lower()
+
+        if ext not in ["jpg", "png"]:
+            self.send_error(404, f"Unsupported extension: .{ext}")
+            return
+
+        try:
+            data = ImageAsset(base).read_bytes(ext=ext)
+        except Exception as e:
+            self.send_error(500, f"Failed to load asset: {ext} {base} {e} ")
+            return
+
+        ctype, _ = mimetypes.guess_type(filename)
+        if ctype is None:
+            ctype = {"jpg": "image/jpg", "png": "image/png"}[ext]
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class LocalAssetServer:
+
+    address: str
+    port: int
+    server: Optional[http.server.ThreadingHTTPServer]
+    thread: Optional[threading.Thread]
+
+    def __init__(self, address: str = "127.0.0.1") -> None:
+        self.address = address
+        self.port = -1
+        self.server = None
+        self.thread = None
+
+    def __enter__(self):
+        self.port = _find_free_port()
+        self.server = http.server.ThreadingHTTPServer(
+            (self.address, self.port), AssetHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.server:
+            self.server.shutdown()
+            del self.server
+
+        if self.thread:
+            self.thread.join()
+            del self.thread
+
+        if exc_type is None:
+            return None
+
+        return False
+
+    @property
+    def base_url(self) -> str:
+        assert self.port is not None
+        return f"http://{self.address}:{self.port}"
+
+    def url_for(self, name: str) -> str:
+        """e.g., name='RGBA_comp.png' -> 'http://127.0.0.1:PORT/RGBA_comp.png'"""
+        return f"{self.base_url}/{name}"
+
+    def get_image_asset(self, name: str) -> Image.Image:
+        return fetch_image(self.url_for(name))
+
+
+@pytest.fixture(scope="session")
+def local_asset_server() -> Generator[LocalAssetServer, None, None]:
+    """
+    Starts a thread based HTTP server bound to 127.0.0.1 on a random free port. 
+    The server currently servers images at:
+    http://127.0.0.1:<port>/<name>.<ext>
+    """
+    with LocalAssetServer() as srv:
+        yield srv
+
+
+@pytest.fixture
+def image_url(request, local_asset_server) -> str:
+    # request.param is one of the IMAGE_ASSETS filenames
+    name = request.param
+    return local_asset_server.url_for(name)
+
+
+@pytest.fixture
+def image_urls(request, local_asset_server) -> list[str]:
+    """Indirect fixture: takes a list of names, returns list of full URLs."""
+    names: list[str] = request.param
+    return [local_asset_server.url_for(name) for name in names]

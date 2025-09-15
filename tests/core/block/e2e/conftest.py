@@ -1,4 +1,8 @@
-from typing import Callable, Iterable, Optional
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from collections.abc import Iterable
+from typing import Callable, Optional
 
 import pytest
 

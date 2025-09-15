@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import os
 import time
-from typing import List
 
 import torch
 from tqdm import tqdm
@@ -43,7 +45,7 @@ def test_run(my_rank, pipe):
 def stress_test(my_rank, pipe):
     print(f"rank {my_rank} stress_test starts....")
 
-    tensors: List[torch.Tensor] = []
+    tensors: list[torch.Tensor] = []
 
     torch.distributed.barrier()
     torch.manual_seed(0)
@@ -135,7 +137,7 @@ if __name__ == "__main__":
     )
 
     config = KVTransferConfig(
-        kv_connector='PyNcclConnector',
+        kv_connector='P2pNcclConnector',
         kv_buffer_device='cuda',
         kv_buffer_size=1e9,
         kv_rank=my_rank,

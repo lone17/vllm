@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vllm.entrypoints.api_server with some extra logging for testing."""
-from typing import Any, Dict, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 import uvicorn
 from fastapi.responses import JSONResponse, Response
 
 import vllm.entrypoints.api_server
+import vllm.envs as envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.utils import FlexibleArgumentParser
@@ -23,7 +27,7 @@ class AsyncLLMEngineWithStats(AsyncLLMEngine):
         self._num_aborts += len(ids)
         await super()._engine_abort(ids)
 
-    def testing_stats(self) -> Dict[str, Any]:
+    def testing_stats(self) -> dict[str, Any]:
         return {"num_aborted_requests": self._num_aborts}
 
 
@@ -43,9 +47,8 @@ if __name__ == "__main__":
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncLLMEngineWithStats.from_engine_args(engine_args)
     vllm.entrypoints.api_server.engine = engine
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        log_level="debug",
-        timeout_keep_alive=vllm.entrypoints.api_server.TIMEOUT_KEEP_ALIVE)
+    uvicorn.run(app,
+                host=args.host,
+                port=args.port,
+                log_level="debug",
+                timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE)

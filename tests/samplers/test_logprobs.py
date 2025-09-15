@@ -1,4 +1,5 @@
-from typing import List
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
 import torch
@@ -7,7 +8,16 @@ from vllm import SamplingParams
 
 from ..conftest import VllmRunner
 
-MODELS = ["facebook/opt-125m"]
+MODELS = ["distilbert/distilgpt2"]
+
+
+@pytest.fixture(scope="function", autouse=True)
+def use_v0_only(monkeypatch):
+    """
+    This module is V0 only since it uses dtype=float, so
+    set VLLM_USE_V1=0 for all tests in the module.
+    """
+    monkeypatch.setenv('VLLM_USE_V1', '0')
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -54,7 +64,7 @@ def test_get_prompt_logprobs(
                                               prompt_logprobs=num_top_logprobs,
                                               temperature=0.0,
                                               detokenize=detokenize)
-        vllm_results = vllm_model.model.generate(
+        vllm_results = vllm_model.llm.generate(
             example_prompts, sampling_params=vllm_sampling_params)
 
     # Test whether logprobs are included in the results.
@@ -68,7 +78,7 @@ def test_get_prompt_logprobs(
             assert (len(logprobs) == num_top_logprobs
                     or len(logprobs) == num_top_logprobs + 1)
         output_text = result.outputs[0].text
-        output_string_from_most_likely_tokens_lst: List[str] = []
+        output_string_from_most_likely_tokens_lst: list[str] = []
         for top_logprobs in result.outputs[0].logprobs:
             top_logprob = next(iter(top_logprobs.values()))
             output_string_from_most_likely_tokens_lst.append(
@@ -164,7 +174,7 @@ def test_none_logprobs(vllm_runner, model, chunked_prefill_token_size: int,
                                                        logprobs=None,
                                                        temperature=0.0,
                                                        detokenize=detokenize)
-        results_logprobs_none = vllm_model.model.generate(
+        results_logprobs_none = vllm_model.llm.generate(
             example_prompts, sampling_params=sampling_params_logprobs_none)
 
     for i in range(len(results_logprobs_none)):

@@ -1,15 +1,24 @@
-from typing import Type
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from concurrent.futures import Future
+from typing import Any, Callable, Optional, Union
+
+import torch
+import torch.distributed as dist
 
 from vllm.config import VllmConfig
 from vllm.executor.executor_base import ExecutorBase
-from vllm.executor.ray_distributed_executor import (  # noqa
-    RayDistributedExecutor as RayDistributedExecutorV0)
 from vllm.executor.uniproc_executor import (  # noqa
     ExecutorWithExternalLauncher as ExecutorWithExternalLauncherV0)
 from vllm.executor.uniproc_executor import (  # noqa
     UniProcExecutor as UniProcExecutorV0)
+from vllm.utils import resolve_obj_by_qualname
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+
+FailureCallback = Callable[[], None]
 
 
 class Executor(ExecutorBase):
@@ -18,20 +27,21 @@ class Executor(ExecutorBase):
     For methods shared by v0 and v1, define them in ExecutorBase"""
 
     @staticmethod
-    def get_class(vllm_config: VllmConfig) -> Type["Executor"]:
-        executor_class: Type[Executor]
+    def get_class(vllm_config: VllmConfig) -> type["Executor"]:
+        executor_class: type[Executor]
         parallel_config = vllm_config.parallel_config
         distributed_executor_backend = (
             parallel_config.distributed_executor_backend)
-        if distributed_executor_backend is None:
-            # If the user does not specify the distributed executor backend,
-            # we will choose the backend based on the world size.
-            if parallel_config.world_size > 1:
-                distributed_executor_backend = "mp"
-            else:
-                distributed_executor_backend = "uni"
-
-        if distributed_executor_backend == "ray":
+        # distributed_executor_backend must be set in VllmConfig.__post_init__
+        if isinstance(distributed_executor_backend, type):
+            if not issubclass(distributed_executor_backend, ExecutorBase):
+                raise TypeError(
+                    "distributed_executor_backend must be a subclass of "
+                    f"ExecutorBase. Got {distributed_executor_backend}.")
+            executor_class = distributed_executor_backend
+        elif distributed_executor_backend == "ray":
+            from vllm.v1.executor.ray_distributed_executor import (  # noqa
+                RayDistributedExecutor)
             executor_class = RayDistributedExecutor
         elif distributed_executor_backend == "mp":
             from vllm.v1.executor.multiproc_executor import MultiprocExecutor
@@ -42,39 +52,69 @@ class Executor(ExecutorBase):
             # TODO: make v1 scheduling deterministic
             # to support external launcher
             executor_class = ExecutorWithExternalLauncher
+        elif isinstance(distributed_executor_backend, str):
+            executor_class = resolve_obj_by_qualname(
+                distributed_executor_backend)
+            if not issubclass(executor_class, ExecutorBase):
+                raise TypeError(
+                    "distributed_executor_backend must be a subclass of "
+                    f"ExecutorBase. Got {executor_class}.")
         else:
             raise ValueError("Unknown distributed executor backend: "
                              f"{distributed_executor_backend}")
         return executor_class
 
-    def initialize(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_from_config(self,
+                               kv_cache_configs: list[KVCacheConfig]) -> None:
         """
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
         """
-        self.collective_rpc("initialize_cache", args=(kv_cache_config, ))
+        self.collective_rpc("initialize_from_config",
+                            args=(kv_cache_configs, ))
         self.collective_rpc("compile_or_warm_up_model")
 
-    def determine_available_memory(self) -> int:  # in bytes
-        output = self.collective_rpc("determine_available_memory")
-        # Since we use a shared centralized controller, we take the minimum
-        # memory size across all workers to make sure all the memory
-        # operators can be applied to all workers.
-        return min(output)
+    def register_failure_callback(self, callback: FailureCallback):
+        """
+        Register a function to be called if the executor enters a permanent
+        failed state.
+        """
+        pass
 
-    def get_kv_cache_spec(self) -> KVCacheSpec:
-        output = self.collective_rpc("get_kv_cache_spec")
-        for x in output:
-            assert x == output[0]
-        return output[0]
+    def determine_available_memory(self) -> list[int]:  # in bytes
+        return self.collective_rpc("determine_available_memory")
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        return self.collective_rpc("get_kv_cache_spec")
+
+    def collective_rpc(self,
+                       method: Union[str, Callable],
+                       timeout: Optional[float] = None,
+                       args: tuple = (),
+                       kwargs: Optional[dict] = None,
+                       non_block: bool = False) -> list[Any]:
+        raise NotImplementedError
 
     def execute_model(
         self,
-        scheduler_output,
-    ) -> ModelRunnerOutput:
+        scheduler_output: SchedulerOutput,
+        non_block: bool = False,
+    ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         output = self.collective_rpc("execute_model",
-                                     args=(scheduler_output, ))
+                                     args=(scheduler_output, ),
+                                     non_block=non_block)
         return output[0]
+
+    def execute_dummy_batch(self) -> None:
+        self.collective_rpc("execute_dummy_batch")
+
+    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+        output = self.collective_rpc("take_draft_token_ids")
+        return output[0]
+
+    @property
+    def max_concurrent_batches(self) -> int:
+        return 1
 
     def profile(self, is_start: bool = True):
         self.collective_rpc("profile", args=(is_start, ))
@@ -85,8 +125,13 @@ class UniProcExecutor(UniProcExecutorV0, Executor):
 
 
 class ExecutorWithExternalLauncher(ExecutorWithExternalLauncherV0, Executor):
-    pass
 
-
-class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
-    pass
+    def determine_available_memory(self) -> list[int]:  # in bytes
+        # same as determine_num_available_blocks in v0,
+        # we need to get the min across all ranks.
+        memory = super().determine_available_memory()
+        from vllm.distributed.parallel_state import get_world_group
+        cpu_group = get_world_group().cpu_group
+        memory_tensor = torch.tensor([memory], device="cpu", dtype=torch.int64)
+        dist.all_reduce(memory_tensor, group=cpu_group, op=dist.ReduceOp.MIN)
+        return [memory_tensor.item()]

@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Adapted from
 # https://github.com/fmmoret/vllm/blob/fm-support-lora-on-quantized-models/tests/lora/test_llama.py
 from dataclasses import dataclass
-from typing import List
 
 import pytest
 
@@ -17,29 +19,29 @@ class ModelWithQuantization:
     quantization: str
 
 
-MODELS: List[ModelWithQuantization]
+MODELS: list[ModelWithQuantization]
 #AWQ quantization is currently not supported in ROCm.
 if current_platform.is_rocm():
     MODELS = [
         ModelWithQuantization(
             model_path="TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ",
-            quantization="GPTQ"),
+            quantization="gptq"),
     ]
 else:
     MODELS = [
         ModelWithQuantization(
             model_path="TheBloke/TinyLlama-1.1B-Chat-v0.3-AWQ",
-            quantization="AWQ"),
+            quantization="awq"),
         ModelWithQuantization(
             model_path="TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ",
-            quantization="GPTQ"),
+            quantization="gptq"),
     ]
 
 
 def do_sample(llm: vllm.LLM,
               lora_path: str,
               lora_id: int,
-              max_tokens: int = 256) -> List[str]:
+              max_tokens: int = 256) -> list[str]:
     raw_prompts = [
         "Give me an orange-ish brown color",
         "Give me a neon pink color",
@@ -59,7 +61,7 @@ def do_sample(llm: vllm.LLM,
         lora_request=LoRARequest(str(lora_id), lora_id, lora_path)
         if lora_id else None)
     # Print the outputs.
-    generated_texts: List[str] = []
+    generated_texts: list[str] = []
     for output in outputs:
         prompt = output.prompt
         generated_text = output.outputs[0].text
@@ -69,12 +71,7 @@ def do_sample(llm: vllm.LLM,
 
 
 @pytest.mark.parametrize("model", MODELS)
-@pytest.mark.parametrize("tp_size", [1])
-def test_quant_model_lora(tinyllama_lora_files, num_gpus_available, model,
-                          tp_size):
-    if num_gpus_available < tp_size and \
-        tp_size > 1 and current_platform.is_cuda_alike():
-        pytest.skip(f"Not enough GPUs for tensor parallelism {tp_size}")
+def test_quant_model_lora(tinyllama_lora_files, model):
 
     llm = vllm.LLM(
         model=model.model_path,
@@ -82,7 +79,6 @@ def test_quant_model_lora(tinyllama_lora_files, num_gpus_available, model,
         max_num_seqs=16,
         max_loras=4,
         max_model_len=400,
-        tensor_parallel_size=tp_size,
         gpu_memory_utilization=0.2,  #avoid OOM
         quantization=model.quantization,
         trust_remote_code=True,
@@ -97,7 +93,7 @@ def test_quant_model_lora(tinyllama_lora_files, num_gpus_available, model,
             "#ff8050",
             "#ff8080",
         ]
-    elif model.quantization == "AWQ":
+    elif model.quantization == "awq":
         expected_no_lora_output = [
             "I'm sorry, I don't understand",
             "I'm sorry, I don't understand",
@@ -106,7 +102,7 @@ def test_quant_model_lora(tinyllama_lora_files, num_gpus_available, model,
             "#f07700: A v",
             "#f00000: A v",
         ]
-    elif model.quantization == "GPTQ":
+    elif model.quantization == "gptq":
         expected_no_lora_output = [
             "I'm sorry, I don't have",
             "I'm sorry, I don't have",
@@ -119,7 +115,7 @@ def test_quant_model_lora(tinyllama_lora_files, num_gpus_available, model,
     def expect_match(output, expected_output):
         # HACK: GPTQ lora outputs are just incredibly unstable.
         # Assert that the outputs changed.
-        if (model.quantization == "GPTQ"
+        if (model.quantization == "gptq"
                 and expected_output is expected_lora_output):
             assert output != expected_no_lora_output
             for i, o in enumerate(output):
@@ -169,13 +165,13 @@ def test_quant_model_tp_equality(tinyllama_lora_files, num_gpus_available,
                                  model):
     if num_gpus_available < 2:
         pytest.skip(f"Not enough GPUs for tensor parallelism {2}")
-
+    if model.quantization == "gptq":
+        pytest.skip("GPTQ lora outputs are just incredibly unstable")
     llm_tp1 = vllm.LLM(
         model=model.model_path,
         enable_lora=True,
         max_num_seqs=16,
         max_loras=4,
-        tensor_parallel_size=1,
         gpu_memory_utilization=0.2,  #avoid OOM
         quantization=model.quantization,
         trust_remote_code=True,

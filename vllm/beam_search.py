@@ -1,7 +1,11 @@
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.sequence import Logprob
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, Union
+
+from vllm.logprobs import Logprob
+from vllm.lora.request import LoRARequest
 
 if TYPE_CHECKING:
     from vllm.multimodal import MultiModalDataDict
@@ -14,15 +18,16 @@ class BeamSearchSequence:
     The text field is optional and will only be filled when the sequence is
     about to be returned to the user.
     """
-    # The tokens includes the prompt.
-    tokens: List[int]
-    logprobs: List[Dict[int, Logprob]]
+    # The tokens include the prompt.
+    tokens: list[int]
+    logprobs: list[dict[int, Logprob]]
+    lora_request: Optional[LoRARequest] = None
     cum_logprob: float = 0.0
     text: Optional[str] = None
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
     multi_modal_data: Optional["MultiModalDataDict"] = None
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None
+    mm_processor_kwargs: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -31,20 +36,31 @@ class BeamSearchOutput:
     It contains the list of the best beam search sequences.
     The length of the list is equal to the beam width.
     """
-    sequences: List[BeamSearchSequence]
+    sequences: list[BeamSearchSequence]
 
 
 class BeamSearchInstance:
 
-    def __init__(self, prompt_tokens: List[int]):
-        self.beams: List[BeamSearchSequence] = [
-            BeamSearchSequence(tokens=prompt_tokens, logprobs=[])
+    def __init__(
+        self,
+        prompt_tokens: list[int],
+        lora_request: Optional[LoRARequest] = None,
+        logprobs: Optional[list[dict[int, Logprob]]] = None,
+        **kwargs,
+    ):
+        self.beams: list[BeamSearchSequence] = [
+            BeamSearchSequence(
+                tokens=prompt_tokens,
+                logprobs=[] if logprobs is None else list(logprobs),
+                lora_request=lora_request,
+                **kwargs,
+            )
         ]
-        self.completed: List[BeamSearchSequence] = []
+        self.completed: list[BeamSearchSequence] = []
 
 
 def get_beam_search_score(
-    tokens: List[int],
+    tokens: list[int],
     cumulative_logprob: float,
     eos_token_id: int,
     length_penalty: float = 1.0,

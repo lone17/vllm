@@ -1,34 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import asyncio
 import os
-import sys
 import threading
 import uuid
 from dataclasses import dataclass
 from multiprocessing import Queue
 from multiprocessing.connection import wait
 from multiprocessing.process import BaseProcess
-from typing import (Any, Callable, Dict, Generic, List, Optional, TextIO,
-                    TypeVar, Union)
+from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar, Union
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.triton_utils.importing import HAS_TRITON
-from vllm.utils import _check_multiproc_method, get_mp_context, run_method
-
-if HAS_TRITON:
-    from vllm.triton_utils import maybe_set_triton_cache_manager
+from vllm.utils import (_maybe_force_spawn, decorate_logs, get_mp_context,
+                        run_method)
 
 logger = init_logger(__name__)
 
 T = TypeVar('T')
 
 _TERMINATE = "TERMINATE"  # sentinel
-
-# ANSI color codes
-CYAN = '\033[1;36m'
-RESET = '\033[0;0m'
 
 JOIN_TIMEOUT_S = 2
 
@@ -214,9 +208,7 @@ def _run_worker_process(
 
     # Add process-specific prefix to stdout and stderr
     process_name = get_mp_context().current_process().name
-    pid = os.getpid()
-    _add_prefix(sys.stdout, process_name, pid)
-    _add_prefix(sys.stderr, process_name, pid)
+    decorate_logs(process_name)
 
     # Initialize worker
     worker = worker_factory(vllm_config, rank)
@@ -248,34 +240,17 @@ def _run_worker_process(
     except Exception:
         logger.exception("Worker failed")
 
+    # Flush TunableOp results when TunableOp is enabled and
+    # online (in situ) tuning is enabled.
+    # Offline tuning API (record_untuned_is_enabled()) only
+    # available in PyTorch 2.6 or later.
+    if torch.cuda.is_available():
+        import torch.cuda.tunable as tunable
+        if (tunable.is_enabled() and tunable.tuning_is_enabled()
+                and not tunable.record_untuned_is_enabled()):
+            tunable.write_file()
+
     logger.info("Worker exiting")
-
-
-def _add_prefix(file: TextIO, worker_name: str, pid: int) -> None:
-    """Prepend each output line with process-specific prefix"""
-
-    prefix = f"{CYAN}({worker_name} pid={pid}){RESET} "
-    file_write = file.write
-
-    def write_with_prefix(s: str):
-        if not s:
-            return
-        if file.start_new_line:  # type: ignore[attr-defined]
-            file_write(prefix)
-        idx = 0
-        while (next_idx := s.find('\n', idx)) != -1:
-            next_idx += 1
-            file_write(s[idx:next_idx])
-            if next_idx == len(s):
-                file.start_new_line = True  # type: ignore[attr-defined]
-                return
-            file_write(prefix)
-            idx = next_idx
-        file_write(s[idx:])
-        file.start_new_line = False  # type: ignore[attr-defined]
-
-    file.start_new_line = True  # type: ignore[attr-defined]
-    file.write = write_with_prefix  # type: ignore[method-assign]
 
 
 def set_multiprocessing_worker_envs(parallel_config):
@@ -283,7 +258,7 @@ def set_multiprocessing_worker_envs(parallel_config):
     in a multiprocessing environment. This should be called by the parent 
     process before worker processes are created"""
 
-    _check_multiproc_method()
+    _maybe_force_spawn()
 
     # Configure thread parallelism if OMP_NUM_THREADS isn't set
     #
@@ -302,7 +277,3 @@ def set_multiprocessing_worker_envs(parallel_config):
             current_parallelism, default_omp_num_threads)
         os.environ["OMP_NUM_THREADS"] = str(default_omp_num_threads)
         torch.set_num_threads(default_omp_num_threads)
-
-    # workaround for https://github.com/vllm-project/vllm/issues/6103
-    if HAS_TRITON and parallel_config.world_size > 1:
-        maybe_set_triton_cache_manager()

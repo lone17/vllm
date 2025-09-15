@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """E2E tests to verify the correctness of the encoder-decoder framework
 
 Run `pytest tests/encoder_decoder/test_e2e_correctness.py`.
 """
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import pytest
 from transformers import AutoModelForSeq2SeqLM
@@ -20,8 +22,17 @@ LIST_ENC_DEC_SUPPORTED_BACKENDS = [
 ]
 
 
+@pytest.fixture(scope="function", autouse=True)
+def use_v0_only(monkeypatch):
+    """
+    Since this module is V0 only, set VLLM_USE_V1=0 for
+    all tests in the module.
+    """
+    monkeypatch.setenv('VLLM_USE_V1', '0')
+
+
 def vllm_to_hf_output(
-    vllm_output: Tuple[List[int], str, Optional[SampleLogprobs]],
+    vllm_output: tuple[list[int], str, Optional[SampleLogprobs]],
     decoder_prompt_type: DecoderPromptType,
 ):
     """Sanitize vllm output to be comparable with hf output."""
@@ -52,6 +63,7 @@ def clear_cache():
     current_platform.is_cpu(),
     reason="CPU backend is not currently supported with encoder/decoder models"
 )
+@pytest.mark.skip(reason="bart not supported in V1")
 def test_encoder_decoder_e2e(
     hf_runner,
     vllm_runner,

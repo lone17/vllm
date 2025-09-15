@@ -1,10 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
                                         DeviceAwareBlockAllocator)
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
 from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
-from vllm.platforms import current_platform
 from vllm.utils import Device
 
 
@@ -53,8 +55,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             - The block IDs are assigned contiguously, with GPU block IDs coming
                 before CPU block IDs.
         """
-        # For HPU, block id 0 is used only for padding
-        reserved_blocks = 1 if current_platform.is_hpu() else 0
+        reserved_blocks = 0
         block_ids = list(
             range(reserved_blocks, num_gpu_blocks + num_cpu_blocks))
         num_gpu_blocks -= reserved_blocks
@@ -339,8 +340,10 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         assert device in self._allocators
         return self._allocators[device].get_prefix_cache_hit_rate()
 
-    def reset_prefix_cache(self) -> bool:
-        """Reset prefix cache for all devices."""
+    def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
+        """Reset prefix cache for specified or all devices."""
+        if device:
+            return self._allocators[device].reset_prefix_cache()
         success = True
         for allocator in self._allocators.values():
             success = success and allocator.reset_prefix_cache()

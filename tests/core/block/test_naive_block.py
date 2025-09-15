@@ -1,4 +1,7 @@
-from typing import List, Optional
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from typing import Optional
 
 import pytest
 
@@ -12,7 +15,7 @@ class TestNaiveBlockAllocator:
     def create_allocate_lambda(allocate_type: str,
                                allocator: NaiveBlockAllocator,
                                prev_block: Optional[Block],
-                               token_ids: List[int]):
+                               token_ids: list[int]):
         if allocate_type == "immutable":
             allocate_block = lambda: allocator.allocate_immutable_block(
                 prev_block=prev_block, token_ids=token_ids)

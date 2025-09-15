@@ -1,29 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from vllm.platforms import current_platform
+import vllm.envs as envs
+from vllm.logger import init_logger
+
+from .base_device_communicator import DeviceCommunicatorBase
+
+logger = init_logger(__name__)
 
 
-class XpuCommunicator:
+class XpuCommunicator(DeviceCommunicatorBase):
 
-    def __init__(self, group: ProcessGroup):
-        if not current_platform.is_xpu():
-            self.disabled = True
-            return
-        self.disabled = False
-        self.group = group
-        self.world_size = dist.get_world_size(self.group)
+    def __init__(self,
+                 cpu_group: ProcessGroup,
+                 device: Optional[torch.device] = None,
+                 device_group: Optional[ProcessGroup] = None,
+                 unique_name: str = ""):
+        super().__init__(cpu_group, device, device_group, unique_name)
+        if self.use_all2all:
+            all2all_backend = envs.VLLM_ALL2ALL_BACKEND
+            if all2all_backend == "naive":
+                from .all2all import NaiveAll2AllManager
+                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
+                logger.info("Using naive all2all manager.")
 
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        dist.all_reduce(x, group=self.group)
-        return x
+    def all_reduce(self, input_) -> torch.Tensor:
+        dist.all_reduce(input_, group=self.device_group)
+        return input_
 
     def gather(self,
                input_: torch.Tensor,
-               rank_in_group: int,
                dst: int = 0,
-               dim: int = -1):
+               dim: int = -1) -> Optional[torch.Tensor]:
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}")
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
         # For xpu path, gather doesn't work properly together with ray
         # cluster so we use all_gather instead for now.
         input_size = input_.size()
@@ -32,10 +51,10 @@ class XpuCommunicator:
                                     dtype=input_.dtype,
                                     device=input_.device)
         # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor,
-                                                 input_,
-                                                 group=self.group)
-        if rank_in_group == dst:
+        dist.all_gather_into_tensor(output_tensor,
+                                    input_,
+                                    group=self.device_group)
+        if self.rank_in_group == dst:
             # Reshape
             output_tensor = output_tensor.movedim(0, dim)
             output_tensor = output_tensor.reshape(input_size[:dim] +
@@ -45,3 +64,6 @@ class XpuCommunicator:
         else:
             output_tensor = None
         return output_tensor
+
+    def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
+        dist.broadcast(input_, src=src, group=self.device_group)

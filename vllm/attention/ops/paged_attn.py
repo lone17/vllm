@@ -1,10 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
 
-from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
+
+if current_platform.is_cuda_alike():
+    from vllm import _custom_ops as ops
+elif current_platform.is_xpu():
+    from vllm._ipex_ops import ipex_ops as ops
 
 if HAS_TRITON:
     from vllm.attention.ops.prefix_prefill import context_attention_fwd
@@ -200,7 +208,6 @@ class PagedAttention:
         block_tables: torch.Tensor,
         query_start_loc: torch.Tensor,
         seq_lens_tensor: torch.Tensor,
-        context_lens: torch.Tensor,
         max_query_len: int,
         alibi_slopes: Optional[torch.Tensor],
         sliding_window: Optional[int],
@@ -208,6 +215,7 @@ class PagedAttention:
         v_scale: torch.Tensor,
     ) -> torch.Tensor:
         output = torch.empty_like(query)
+        max_seq_len = None
         context_attention_fwd(
             query,
             key,
@@ -218,9 +226,9 @@ class PagedAttention:
             value_cache,
             block_tables,
             # query_start_loc is (batch_size + 1,)
-            query_start_loc[:-1],
+            query_start_loc,
             seq_lens_tensor,
-            context_lens,
+            max_seq_len,
             max_query_len,
             k_scale,
             v_scale,

@@ -1,14 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
-from typing import Sequence as GenericSequence
-from typing import Tuple
+from collections.abc import Sequence as GenericSequence
+from itertools import count
+from typing import Any, Optional, Union
 
-from vllm import SamplingParams
+import torch
+
 from vllm.core.scheduler import Scheduler, SchedulerOutputs
-from vllm.inputs import EncoderDecoderInputs, token_inputs
+from vllm.inputs import EncoderDecoderInputs, embeds_inputs, token_inputs
 from vllm.lora.request import LoRARequest
-from vllm.sequence import (Logprob, Sequence, SequenceGroup,
+from vllm.sampling_params import SamplingParams
+from vllm.sequence import (Logprob, Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata)
 
 
@@ -17,11 +22,11 @@ def create_dummy_prompt(
     prompt_length: int = -1,
     block_size: Optional[int] = None,
     lora_request: Optional[LoRARequest] = None,
-    best_of: int = 1,
-    prompt_tokens: Optional[List[int]] = None,
+    prompt_tokens: Optional[list[int]] = None,
+    prompt_embeds: Optional[torch.Tensor] = None,
     min_tokens: int = 0,
     max_tokens: int = 16,
-) -> Tuple[Sequence, SequenceGroup]:
+) -> tuple[Sequence, SequenceGroup]:
     if not block_size:
         block_size = prompt_length
 
@@ -31,22 +36,28 @@ def create_dummy_prompt(
         prompt_tokens = list(range(prompt_length))
 
     prompt_str = " ".join([str(t) for t in prompt_tokens])
-    prompt = Sequence(int(request_id),
-                      inputs=token_inputs(prompt_tokens, prompt=prompt_str),
-                      block_size=block_size)
-    seq_group = SequenceGroup(request_id=request_id,
-                              seqs=[prompt],
-                              arrival_time=time.time(),
-                              sampling_params=SamplingParams(
-                                  best_of=best_of,
-                                  max_tokens=max_tokens,
-                                  min_tokens=min_tokens),
-                              lora_request=lora_request)
+    inputs = token_inputs(
+        prompt_token_ids=prompt_tokens,
+        prompt=prompt_str) if prompt_embeds is None else embeds_inputs(
+            prompt_embeds=prompt_embeds)
+    prompt = Sequence(
+        int(request_id),
+        inputs=inputs,
+        block_size=block_size,
+    )
+    seq_group = SequenceGroup(
+        request_id=request_id,
+        seqs=[prompt],
+        arrival_time=time.time(),
+        sampling_params=SamplingParams(max_tokens=max_tokens,
+                                       min_tokens=min_tokens),
+        lora_request=lora_request,
+    )
 
     return prompt, seq_group
 
 
-def create_dummy_lora_sequence(request_id: int, token_ids: List[int],
+def create_dummy_lora_sequence(request_id: int, token_ids: list[int],
                                block_size: int, lora_int_id: int) -> Sequence:
     return Sequence(seq_id=request_id,
                     inputs=token_inputs(token_ids),
@@ -56,7 +67,7 @@ def create_dummy_lora_sequence(request_id: int, token_ids: List[int],
                                              lora_int_id=lora_int_id))
 
 
-def create_dummy_sequence(request_id: int, token_ids: List[int],
+def create_dummy_sequence(request_id: int, token_ids: list[int],
                           block_size: int) -> Sequence:
     return Sequence(
         seq_id=request_id,
@@ -71,8 +82,7 @@ def create_dummy_prompt_encoder_decoder(
     encoder_prompt_length: int,
     block_size: Optional[int] = None,
     lora_request: Optional[LoRARequest] = None,
-    best_of: int = 1,
-) -> Tuple[Sequence, Sequence, SequenceGroup]:
+) -> tuple[Sequence, Sequence, SequenceGroup]:
     if not block_size:
         block_size = decoder_prompt_length
 
@@ -101,7 +111,6 @@ def create_dummy_prompt_encoder_decoder(
 
     seq_group = SequenceGroup(request_id=request_id,
                               seqs=[decoder_prompt],
-                              sampling_params=SamplingParams(best_of=best_of),
                               arrival_time=time.time(),
                               lora_request=lora_request,
                               encoder_seq=encoder_prompt)
@@ -123,7 +132,7 @@ def create_seq_group(
 
     prompt_token_ids = [0] * seq_prompt_len
 
-    seqs: List[Sequence] = []
+    seqs: list[Sequence] = []
     for seq_id_offset, output_len in enumerate(seq_output_lens):
         seq = Sequence(
             seq_id=seq_id_start + seq_id_offset,
@@ -239,7 +248,7 @@ class SchedulerProxy:
 
     def __init__(self, scheduler: Scheduler):
         self.scheduler_ = scheduler
-        self.call_history: Dict[str, List[Any]] = defaultdict(list)
+        self.call_history: dict[str, list[Any]] = defaultdict(list)
 
     def __getattr__(self, name: str) -> Any:
 
@@ -251,6 +260,133 @@ class SchedulerProxy:
         return wrapper
 
     def last_schedule_ret(
-        self, ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, Any]:
+        self, ) -> tuple[list[SequenceGroupMetadata], SchedulerOutputs, Any]:
         _, _, ret = self.call_history["schedule"][-1]
         return ret
+
+
+def create_seq_group_metadata_from_prompts(
+    prompts: list[list[int]],
+    num_gpu_blocks: int,
+    block_size: int,
+    final_prompt_lens: list[int],
+    continuations: Optional[list[list[int]]] = None,
+    seq_ids: Optional[list[int]] = None,
+) -> list[SequenceGroupMetadata]:
+
+    if continuations is None:
+        continuations = [[] for _ in prompts]
+
+    if seq_ids is None:
+        seq_ids = list(i for i, _ in enumerate(prompts))
+
+    free_gpu_blocks = list(range(num_gpu_blocks))
+
+    block_allocations = {
+        i: [
+            free_gpu_blocks.pop()
+            for _ in range(round_up_to_next_block(final_len, block_size))
+        ]
+        for i, final_len in enumerate(final_prompt_lens)
+    }
+
+    seq_grou_metadata_list = []
+    for i, (prompt_token_ids,
+            cont_token_ids) in enumerate(zip(prompts, continuations)):
+        data = SequenceData.from_seqs(prompt_token_ids, cont_token_ids)
+        data.update_num_computed_tokens(
+            len(prompt_token_ids) + len(cont_token_ids) - 1)
+        seq_data = {i: data}
+        seq_grou_metadata_list.append(
+            SequenceGroupMetadata(
+                request_id=str(i),
+                is_prompt=len(cont_token_ids) == 0,
+                seq_data=seq_data,
+                sampling_params=SamplingParams(temperature=0.0),
+                block_tables={i: block_allocations[i][:]},
+            ))
+    return seq_grou_metadata_list
+
+
+def create_chunked_seq_group_metadata_from_prompt(
+        prompt: list[int],
+        num_gpu_blocks: int,
+        chunk_size: int,
+        block_size: int,
+        seq_id: Optional[int] = None) -> list[SequenceGroupMetadata]:
+
+    if seq_id is None:
+        seq_id = 0
+
+    free_gpu_blocks = list(range(num_gpu_blocks))
+
+    block_allocations = [
+        free_gpu_blocks.pop()
+        for _ in range(round_up_to_next_block(len(prompt), block_size))
+    ]
+
+    seq_group_metadata_list = []
+    for i, idx in enumerate(range(0, len(prompt), chunk_size)):
+        chunk_ids = prompt[idx:idx + chunk_size]
+        data = SequenceData.from_seqs(prompt)
+        data.update_num_computed_tokens(idx)
+        seq_data = {i: data}
+        seq_group_metadata_list.append(
+            SequenceGroupMetadata(
+                request_id=str(seq_id),
+                is_prompt=True,
+                do_sample=idx + chunk_size >= len(prompt),  # terminal chunk
+                seq_data=seq_data,
+                sampling_params=SamplingParams(temperature=0.0),
+                block_tables={i: block_allocations},
+                token_chunk_size=len(chunk_ids)))
+    return seq_group_metadata_list
+
+
+def create_batch(batch_size,
+                 k,
+                 prompt_len: Union[int, list[int]] = 10,
+                 prev_output_token_len: int = 10,
+                 seq_ids: Optional[list[int]] = None,
+                 num_gpu_blocks: Optional[int] = None,
+                 block_size: Optional[int] = None,
+                 prefill_chunk_size: Optional[int] = None):
+    if block_size is None:
+        block_size = 8
+
+    if num_gpu_blocks is None:
+        num_gpu_blocks = 2048 // block_size
+
+    iterator = count()
+
+    if isinstance(prompt_len, int):
+        prompt_lens = [prompt_len for _ in range(batch_size)]
+    else:
+        prompt_lens = prompt_len
+
+    prompts = [[next(iterator) for _ in range(p_len)] for p_len in prompt_lens]
+
+    if prefill_chunk_size:
+        # Create a batch of chunked prompts.
+        if not seq_ids:
+            seq_ids = list(range(len(prompts)))
+        seq_group_metadata_list = []
+        for p, sid in zip(prompts, seq_ids):
+            seq_group_metadata_list += \
+                create_chunked_seq_group_metadata_from_prompt(
+                p, num_gpu_blocks, prefill_chunk_size, block_size, sid)
+        seq_group_metadata_list = seq_group_metadata_list[:batch_size]
+        prev_output_tokens = []
+    else:
+        prev_output_tokens = [[
+            next(iterator) for _ in range(prev_output_token_len)
+        ] for _ in range(batch_size)]
+        final_prompt_lens = [
+            len(prompt) + len(prev_output_token) + k + 1
+            for prompt, prev_output_token in zip(prompts, prev_output_tokens)
+        ]
+
+        seq_group_metadata_list = create_seq_group_metadata_from_prompts(
+            prompts, num_gpu_blocks, block_size, final_prompt_lens,
+            prev_output_tokens, seq_ids)
+    return seq_group_metadata_list, prompts, prev_output_tokens
