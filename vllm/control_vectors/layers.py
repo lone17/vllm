@@ -95,9 +95,13 @@ class LayerNormWithSteering(nn.Module):
         # 2: adaptive to 2nd direction on span(1st dir, 2nd dir)
         # 3: adaptive to 1st direction on span(1st dir, hidden_states)
         # 4: non-adaptive on span(1st dir, hidden_states)
+        # 5: activation addition
+        # 6: directional ablation
         self.adaptive_mode_collection: dict[int, int] = {}
 
         self.target_degree_collection: dict[int, float] = {}
+
+        self.scale_factor_collection: dict[int, float] = {}
 
         # u@u^T + v@v^T
         self.proj_matrices: dict[int, torch.Tensor | None] = {}
@@ -126,6 +130,7 @@ class LayerNormWithSteering(nn.Module):
             self.second_directions_collection[index] = None
         self.adaptive_mode_collection[index] = steer_weights.adaptive_mode
         self.target_degree_collection[index] = target_degree
+        self.scale_factor_collection[index] = steer_weights.scale_factor
 
         proj_matrix, rotated_component = self._get_rotation_args(
             self.first_directions_collection[index],
@@ -210,6 +215,8 @@ class LayerNormWithSteering(nn.Module):
 
             adaptive_mode = self.adaptive_mode_collection[self.active_index]
 
+            rotated_component = None
+            proj_matrix = None
             if adaptive_mode in {0, 1, 2}:
                 proj_matrix = self.proj_matrices[self.active_index].to(
                     device, dtype=dtype
@@ -235,17 +242,34 @@ class LayerNormWithSteering(nn.Module):
                 proj_matrix = proj_matrix.to(device, dtype=dtype)
                 rotated_component = rotated_component.to(device, dtype=dtype)
 
-            # hidden_states: batch x hidden_dim
-            # proj_matrix: (batch) x hidden_dim x hidden_dim
-            # Px: batch x hidden_dim
-            # scale: batch x 1
-            Px = torch.einsum("...i, ...ij -> ...j", hidden_states, proj_matrix)
-            scale = Px.norm(dim=-1, keepdim=True)
+            Px = None
+            scale = None
+            if adaptive_mode not in {5, 6}:
+                # hidden_states: batch x hidden_dim
+                # proj_matrix: (batch) x hidden_dim x hidden_dim
+                # Px: batch x hidden_dim
+                # scale: batch x 1
+                Px = torch.einsum("...i, ...ij -> ...j", hidden_states, proj_matrix)
+                scale = Px.norm(dim=-1, keepdim=True)
 
-            if adaptive_mode in {0, 4}:
+            if adaptive_mode in {5}:
+                feature_direction = self.first_directions_collection[
+                    self.active_index
+                ].to(device, dtype=dtype)
+                scale_factor = self.scale_factor_collection[self.active_index]
+                hidden_states += scale_factor * feature_direction
+            elif adaptive_mode in {6}:
+                feature_direction = self.first_directions_collection[
+                    self.active_index
+                ].to(device, dtype=dtype)
+                proj_to_feature_direction = hidden_states @ feature_direction
+                hidden_states -= (
+                    proj_to_feature_direction.unsqueeze(1) * feature_direction
+                )
+            elif adaptive_mode in {0, 4}:
                 hidden_states += -Px + scale * rotated_component
             else:
-                if adaptive_mode == 1:
+                if adaptive_mode in {1, 3, 5}:
                     feature_direction = self.first_directions_collection[
                         self.active_index
                     ]
@@ -253,18 +277,17 @@ class LayerNormWithSteering(nn.Module):
                     feature_direction = self.second_directions_collection[
                         self.active_index
                     ]
-                elif adaptive_mode == 3:
-                    feature_direction = self.first_directions_collection[
-                        self.active_index
-                    ]
                 else:
                     raise ValueError(f"Invalid adaptive mode: {adaptive_mode}")
 
                 feature_direction = feature_direction.to(device, dtype=dtype)
+
                 proj_to_feature_direction = hidden_states @ feature_direction
                 mask = proj_to_feature_direction > 0
 
                 # hidden_states: batch x hidden_dim
+                # feature_direction: hidden_dim
+                # proj_to_feature_direction: batch
                 # mask: batch
                 # scale: batch
                 # rotated_component: (batch) x hidden_dim
