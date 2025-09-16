@@ -9,6 +9,7 @@ from typing import Any, Optional, Union
 import msgspec
 import torch
 
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -54,6 +55,7 @@ class EngineCoreRequest(
     eos_token_id: Optional[int]
     arrival_time: float
     lora_request: Optional[LoRARequest]
+    control_vector_request: Optional[ControlVectorRequest]
     cache_salt: Optional[str]
     data_parallel_rank: Optional[int]
 

@@ -185,7 +185,6 @@ class OpenAIServingChat(OpenAIServing):
         try:
             lora_request, control_vector_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True)
-
             model_name = self.models.model_name(lora_request)
 
             tokenizer = await self.engine_client.get_tokenizer(lora_request)

@@ -1752,6 +1752,7 @@ async def init_app_state(
     )
     # Init LoRA
     await state.openai_serving_models.init_static_loras()
+    await state.openai_serving_models.init_steering()
     state.openai_serving_responses = OpenAIServingResponses(
         engine_client,
         model_config,

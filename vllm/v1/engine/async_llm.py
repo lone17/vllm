@@ -13,6 +13,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.utils import _validate_truncation_size
@@ -267,6 +268,7 @@ class AsyncLLM(EngineClient):
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
@@ -284,7 +286,7 @@ class AsyncLLM(EngineClient):
 
         # Convert Input --> Request.
         prompt_str, request = self.processor.process_inputs(
-            request_id, prompt, params, arrival_time, lora_request,
+            request_id, prompt, params, arrival_time, lora_request, control_vector_request,
             tokenization_kwargs, trace_headers, priority, data_parallel_rank)
 
         if is_pooling or params.n == 1:
@@ -328,6 +330,7 @@ class AsyncLLM(EngineClient):
         sampling_params: SamplingParams,
         request_id: str,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
@@ -374,6 +377,7 @@ class AsyncLLM(EngineClient):
                 prompt,
                 sampling_params,
                 lora_request=lora_request,
+                control_vector_request=control_vector_request,
                 trace_headers=trace_headers,
                 priority=priority,
                 tokenization_kwargs=tokenization_kwargs,

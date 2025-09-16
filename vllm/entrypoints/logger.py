@@ -44,7 +44,7 @@ class RequestLogger:
             "params: %s, prompt_token_ids: %s, "
             "prompt_embeds shape: %s, "
             "lora_request: %s, ", 
-            "control_vector_request: %s."request_id, prompt, params, prompt_token_ids,
+            "control_vector_request: %s.", request_id, prompt, params, prompt_token_ids,
             prompt_embeds.shape if prompt_embeds is not None else None,
             lora_request, control_vector_request)
 

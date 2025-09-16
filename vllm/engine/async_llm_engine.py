@@ -13,6 +13,7 @@ import vllm.envs as envs
 from vllm.config import (DecodingConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, VllmConfig)
 from vllm.config.lora import LoRAConfig
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_timeout import asyncio_timeout
@@ -777,6 +778,7 @@ class AsyncLLMEngine(EngineClient):
         params: SamplingParams,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
@@ -804,6 +806,7 @@ class AsyncLLMEngine(EngineClient):
             params=params,
             arrival_time=arrival_time or time.time(),
             lora_request=lora_request,
+            control_vector_request=control_vector_request,
             trace_headers=trace_headers,
             priority=priority,
             data_parallel_rank=data_parallel_rank,
@@ -818,6 +821,7 @@ class AsyncLLMEngine(EngineClient):
         sampling_params: SamplingParams,
         request_id: str,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
@@ -894,6 +898,7 @@ class AsyncLLMEngine(EngineClient):
                     prompt,
                     sampling_params,
                     lora_request=lora_request,
+                    control_vector_request=control_vector_request,
                     trace_headers=trace_headers,
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,

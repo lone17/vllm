@@ -675,6 +675,7 @@ class SyncMPClient(MPClient):
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):
         self.ensure_alive()
         self.free_pending_messages()
+        
         # (Identity, RequestType, SerializedRequest)
         msg = (self.core_engine, request_type.value,
                *self.encoder.encode(request))

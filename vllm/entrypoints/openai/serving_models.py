@@ -106,14 +106,14 @@ class OpenAIServingModels:
         for steering_config in self.steering_config_paths:
             unique_id = self.control_vector_id_counter.inc(1)
             load_request = ControlVectorRequest(
-            control_vector_name=steering_config.name,
-            control_vector_id=unique_id,
-            control_vector_local_path=steering_config.local_path,
-            scale=int(steering_config.scale),
-            target_degree=float(steering_config.target_degree),
-            keep_norm=steering_config.keep_norm,
-            adaptive_mode=int(steering_config.adaptive_mode),
-        )
+                control_vector_name=steering_config.name,
+                control_vector_id=unique_id,
+                control_vector_local_path=steering_config.local_path,
+                scale=int(steering_config.scale),
+                target_degree=float(steering_config.target_degree),
+                keep_norm=steering_config.keep_norm,
+                adaptive_mode=int(steering_config.adaptive_mode),
+            )
             self.control_vector_requests.append(load_request)
 
     def is_base_model(self, model_name) -> bool:

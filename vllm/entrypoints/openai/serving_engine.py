@@ -7,7 +7,7 @@ import traceback
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
-from typing import Any, Callable, ClassVar, Generic, Optional, Tuple, sTypeVar, Union
+from typing import Any, Callable, ClassVar, Generic, Optional, Tuple, TypeVar, Union
 
 import torch
 from fastapi import Request
