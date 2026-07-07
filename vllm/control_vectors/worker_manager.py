@@ -72,6 +72,10 @@ class WorkerControlVectorManager(AbstractWorkerManager):
                 target_degree=control_vector_request.target_degree,
                 keep_norm=control_vector_request.keep_norm,
                 adaptive_mode=control_vector_request.adaptive_mode,
+                similarity_kernel=control_vector_request.similarity_kernel,
+                new_adaptive=control_vector_request.new_adaptive,
+                steering_vec_reversed=control_vector_request.steering_vec_reversed,
+                no_of_pc=control_vector_request.no_of_pc,
             )
         except Exception as e:
             raise RuntimeError(

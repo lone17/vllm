@@ -1128,6 +1128,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         model_config = self.model_config
         cache_config = self.cache_config
 
+        # self.act_model_count = 0
+
         self.is_driver_worker = is_driver_worker
         self.return_hidden_states = return_hidden_states
 
@@ -1857,14 +1859,18 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
         decode_meta = model_input.attn_metadata.decode_metadata
+        # print("Decode Meta:", decode_meta)
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
+        # self.act_model_count += 1
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][graph_batch_size]
+            # print("Graph Model Count:", self.act_model_count, virtual_engine, model_input.input_tokens.shape, len(self.graph_runners))
         else:
+            # print("Actual Model Count:", self.act_model_count)
             model_executable = self.model
 
         # Receive KV cache in distributed KV cache transfer setting

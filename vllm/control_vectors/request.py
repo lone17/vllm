@@ -16,6 +16,10 @@ class ControlVectorRequest(AdapterRequest):
     target_degree: float = 0.0
     keep_norm: bool = False
     adaptive_mode: int = 0
+    similarity_kernel: str = "gaussian" # For Adaptive Mode 7, 8
+    new_adaptive: bool = False
+    steering_vec_reversed: bool = False
+    no_of_pc: int = 10
 
     def __hash__(self):
         return super().__hash__()

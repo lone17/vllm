@@ -43,6 +43,8 @@ def get_control_vector_id():
 _all_cv_classes = {
     "post_attention_layernorm": LayerNormWithSteering,
     "input_layernorm": LayerNormWithSteering,
+    "pre_feedforward_layernorm": LayerNormWithSteering,
+    "post_feedforward_layernorm": LayerNormWithSteering,
 }
 # _all_cv_classes = {"mlp": MLPWithControlVector}
 
@@ -89,6 +91,10 @@ class ControlVectorModel(AdapterModel):
         scale_factor: float = 1.0,
         keep_norm: bool = False,
         adaptive_mode: int = 0,
+        similarity_kernel: str = "gaussian",
+        new_adaptive: bool = False,
+        steering_vec_reversed: bool = False,
+        no_of_pc: int = 10,
     ) -> "ControlVectorModel":
 
         try:
@@ -149,9 +155,11 @@ class ControlVectorModel(AdapterModel):
                         module_name = f"model.{module_name}"
 
                     steering_configs[module_name] = SteererWeights(
-                        first_direction=torch.from_numpy(
-                            layer_config["first_direction"]
-                        ).to(device),
+                        first_direction=(
+                            torch.from_numpy(layer_config["first_direction"]).to(device)
+                            if "first_direction" in layer_config
+                            else None
+                        ),
                         second_direction=(
                             torch.from_numpy(layer_config["second_direction"]).to(
                                 device
@@ -162,6 +170,55 @@ class ControlVectorModel(AdapterModel):
                         scale_factor=layer_config.get("scale_factor", scale_factor),
                         target_degree=layer_config.get("angle", target_degree),
                         adaptive_mode=layer_config.get("adaptive_mode", adaptive_mode),
+                        source_acts_normed_clusters=(
+                            torch.from_numpy(layer_config["source_acts_normed_clusters"]).to(device)
+                            if "source_acts_normed_clusters" in layer_config
+                            else None
+                        ),
+                        target_acts_normed_clusters=(
+                            torch.from_numpy(layer_config["target_acts_normed_clusters"]).to(device)
+                            if "target_acts_normed_clusters" in layer_config
+                            else None
+                        ),
+                        transport_plan=(
+                            torch.from_numpy(layer_config["transport_plan"]).to(device)
+                            if "transport_plan" in layer_config
+                            else None
+                        ),
+                        similarity_kernel=similarity_kernel,
+                        cluster_steering_vectors=(
+                            torch.from_numpy(layer_config["cluster_steering_vectors"]).to(device)
+                            if "cluster_steering_vectors" in layer_config
+                            else None
+                        ),
+                        new_adaptive=new_adaptive,
+                        steering_vec_reversed=steering_vec_reversed,
+                        v_bar=(
+                            torch.from_numpy(layer_config["v_bar"]).to(device)
+                            if "v_bar" in layer_config
+                            else None
+                        ),
+                        pc_scores=(
+                            torch.from_numpy(layer_config["pc_scores"]).to(device)
+                            if "pc_scores" in layer_config
+                            else None
+                        ),
+                        top_K_pc=(
+                            torch.from_numpy(layer_config["top_K_pc"]).to(device)
+                            if "top_K_pc" in layer_config
+                            else None
+                        ),
+                        no_of_pc=no_of_pc,
+                        diag_affine_map=(
+                            torch.from_numpy(layer_config["diag_affine_map"]).to(device)
+                            if "diag_affine_map" in layer_config
+                            else None
+                        ),
+                        low_rank_components=(
+                            torch.from_numpy(layer_config["low_rank_components"]).to(device)
+                            if "low_rank_components" in layer_config
+                            else None
+                        ),
                     )
 
             return cls(control_vector_id, steering_configs)
